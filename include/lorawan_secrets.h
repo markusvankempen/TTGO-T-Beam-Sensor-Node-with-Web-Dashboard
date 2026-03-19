@@ -1,0 +1,24 @@
+#pragma once
+
+#include <Arduino.h>
+
+// OTAA keys for LoRaWAN.
+// APPEUI and DEVEUI must be in little-endian format for LMIC.
+// APPKEY is in normal big-endian byte order.
+//
+// Fill these with your values from your LoRaWAN console:
+// - APPEUI  (aka JoinEUI)
+// - DEVEUI
+// - APPKEY  (aka AppKey / NwkKey depending on stack naming)
+//
+// Example formatting help (do not paste this literal line):
+// { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 }
+
+static const uint8_t APPEUI[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99 };
+static const uint8_t DEVEUI[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99 };
+static const uint8_t APPKEY[16] = {
+  0x99, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x99
+};
