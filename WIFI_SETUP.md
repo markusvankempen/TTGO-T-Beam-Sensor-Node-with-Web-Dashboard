@@ -15,6 +15,9 @@ Your TTGO T-Beam now includes a comprehensive web dashboard with:
 - WiFi Manager for easy configuration
 - Serial command interface
 
+> **📸 Screenshots:** See [README.md](README.md#web-dashboard-screenshots) for web dashboard screenshots, or use the automated [screenshot capture tool](SCREENSHOTS.md) to generate your own.
+
+
 ## First Time Setup
 
 ### Method 1: Automatic WiFi Configuration Portal

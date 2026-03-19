@@ -121,6 +121,38 @@ This firmware includes a comprehensive web dashboard with multiple pages! See [W
 3. Connect and configure your WiFi
 4. Access dashboard at device IP address
 5. View real-time sensor data and GPS location on OpenStreetMap
+### Web Dashboard Screenshots
+
+> **Note:** Screenshots can be automatically captured using the included Python script. See [SCREENSHOTS.md](SCREENSHOTS.md) for instructions.
+
+#### Dashboard - Real-time Sensor Data & GPS Tracking
+![Dashboard](screenshots/dashboard.png)
+*Live sensor readings with OpenStreetMap integration showing GPS location*
+
+#### Settings - System Configuration
+![Settings](screenshots/settings.png)
+*Configure WiFi, GPS, display, and power management settings*
+
+#### LoRa Configuration - OTAA/ABP Keys
+![LoRa Config](screenshots/config.png)
+*Manage LoRaWAN activation mode and security keys*
+
+#### Payload Configuration - Channel Management
+![Payload Info](screenshots/payload-info.png)
+*Enable/disable CayenneLPP channels and configure PAX counter*
+
+#### Diagnostics - System Health & Statistics
+![Diagnostics](screenshots/diagnostics.png)
+*Monitor uplink/downlink counters, frame counters, and system metrics*
+
+#### Debug Console - Live System Output
+![Debug Console](screenshots/debug.png)
+*Real-time serial output and debug message streaming*
+
+#### About - Project Information
+![About](screenshots/about.png)
+*Developer details, license, and project information*
+
 
 **Serial Commands:**
 - `menu` - Interactive configuration menu
@@ -197,6 +229,24 @@ platformio run
 platformio run --target upload --upload-port /dev/cu.usbserial-01E5CD55
 platformio device monitor --baud 115200 --port /dev/cu.usbserial-01E5CD55
 ```
+
+## Screenshot Capture Tool
+
+An automated Python script is included to capture screenshots of all web dashboard pages:
+
+```bash
+# Install dependencies
+pip install -r requirements-screenshots.txt
+
+# Capture all pages (ensure device is powered on and connected)
+python3 capture_screenshots.py
+
+# Custom IP address
+python3 capture_screenshots.py --ip 192.168.1.100
+```
+
+The script automatically captures full-page screenshots of all 7 web pages and saves them to the `screenshots/` directory. See [SCREENSHOTS.md](SCREENSHOTS.md) for detailed instructions.
+
 
 ## Troubleshooting Quick Guide
 

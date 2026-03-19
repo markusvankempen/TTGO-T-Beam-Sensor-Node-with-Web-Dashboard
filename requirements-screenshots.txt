@@ -1,0 +1,5 @@
+# Requirements for TTGO T-Beam Screenshot Capture Tool
+# Install with: pip install -r requirements-screenshots.txt
+
+selenium>=4.15.0
+webdriver-manager>=4.0.0
