@@ -55,8 +55,8 @@
  *   - Serial commands: wifi-status, wifi-reset, help
  *   - JSON API: http://DEVICE_IP/api/data
  *
- * Version: 2.6.0
- * Last Updated: 2026-03-19
+ * Version: 2.7.3
+ * Last Updated: 2026-03-22
  *
  * Version History:
  *   See CHANGELOG.md for complete version history
@@ -78,13 +78,17 @@
 #include <time.h>
 #include <sys/time.h>
 #include <WiFi.h>
-#include <WiFiManager.h>
+#include <esp_wifi.h>
+#include <driver/gpio.h>  // gpio_intr_disable() for OTA flash-write safety
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <NimBLEDevice.h>
 #include <NimBLEScan.h>
 #include <NimBLEAdvertisedDevice.h>
+#include <Update.h>
+#include <HTTPClient.h>
+#include <PubSubClient.h>
 #include "lorawan_secrets.h"
 
 // -----------------------------------------------------------------------------
@@ -170,8 +174,9 @@ DebugSerial DebugSerial_instance(&Serial);
 // -----------------------------------------------------------------------------
 // Firmware Version
 // -----------------------------------------------------------------------------
-const char* FIRMWARE_VERSION = "2.6.0";
-const char* FIRMWARE_DATE = "2026-03-19";
+const char* FIRMWARE_VERSION = "2.7.3";
+const char* FIRMWARE_DATE = "2026-03-23";
+const char* BUILD_TIMESTAMP = __DATE__ " " __TIME__;
 
 // -----------------------------------------------------------------------------
 // Board and peripheral pin configuration
@@ -243,8 +248,34 @@ HardwareSerial GpsSerial(1);
 CayenneLPP lpp(120);
 osjob_t sendjob;
 AsyncWebServer server(80);
-WiFiManager wifiManager;
 Preferences preferences;
+
+// MQTT Client
+WiFiClient mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
+
+// MQTT Configuration
+bool mqttEnabled = false;
+String mqttServer = "";
+uint16_t mqttPort = 1883;
+String mqttUsername = "";
+String mqttPassword = "";
+String mqttTopic = "ttgo/sensor";
+String mqttDeviceName = "TTGO-T-Beam";
+unsigned long lastMqttAttempt = 0;
+unsigned long mqttReconnectInterval = 5000; // 5 seconds
+bool mqttConnected = false;
+unsigned long mqttPublishCounter = 0;
+unsigned long mqttPublishInterval = 60000; // 60 seconds default
+unsigned long lastMqttPublish = 0;
+
+// MQTT Payload Configuration (which fields to include)
+bool mqttIncludeTimestamp = true;
+bool mqttIncludeBME280 = true;
+bool mqttIncludeGPS = true;
+bool mqttIncludeBattery = true;
+bool mqttIncludePAX = true;
+bool mqttIncludeSystem = true;
 
 // LoRaWAN keys - loaded from NVS or defaults from lorawan_secrets.h
 uint8_t storedAPPEUI[8];
@@ -286,8 +317,10 @@ bool clockSynced = false;
 bool wifiConnected = false;
 bool wifiConfigMode = false;
 bool wifiEnabled = true;
+bool wifiConnecting = false;
 bool debugEnabled = false;
 bool displayEnabled = true;
+bool otaInProgress = false;  // Flag to stop main loop during OTA
 float seaLevelPressureHpa = 1013.25f;
 unsigned long lastUpdate = 0;
 unsigned long lastPageRotate = 0;
@@ -303,6 +336,7 @@ unsigned long lastSystemDebugAt = 0;
 unsigned long lastClockSyncAt = 0;
 unsigned long lastAxpDebugAt = 0;
 unsigned long gpsRawDebugStartAt = 0;
+unsigned long wifiConnectStartedAt = 0;
 uint8_t displayPage = 0;
 uint8_t burnInShiftIndex = 0;
 uint8_t gpsProfileIndex = 0;
@@ -333,6 +367,20 @@ uint16_t bleDeviceCount = 0;
 uint16_t totalPaxCount = 0;
 NimBLEScan* pBLEScan = nullptr;
 std::set<std::string> bleDevices; // Track unique BLE devices by address
+// GPS path tracking - circular buffer for last 20 positions
+// GPS path tracking - configurable size (5-100 positions)
+#define GPS_PATH_MAX_SIZE 100
+int gpsPathSize = 20; // Default: 20 positions, configurable via web UI
+struct GpsPosition {
+  double lat;
+  double lon;
+  uint32_t timestamp;
+  bool valid;
+};
+GpsPosition gpsPath[GPS_PATH_MAX_SIZE];
+int gpsPathIndex = 0;
+int gpsPathCount = 0;
+
 
 // Debug console circular buffer
 #define DEBUG_BUFFER_SIZE 100
@@ -1223,7 +1271,7 @@ void processDownlinkCommand(uint8_t* data, uint8_t len) {
           enableDisplay();
         }
         break;
-        
+
       default:
         Serial.print("  ✗ Unknown enhanced command: 0x");
         Serial.println(cmd, HEX);
@@ -1256,7 +1304,9 @@ void processDownlinkCommand(uint8_t* data, uint8_t len) {
       
     case 0x03: // WiFi Reset
       Serial.println("  → WiFi Reset");
-      wifiManager.resetSettings();
+      preferences.begin("wifi", false);
+      preferences.clear();
+      preferences.end();
       delay(1000);
       ESP.restart();
       break;
@@ -1421,8 +1471,8 @@ void performPaxScan() {
   wifiDeviceCount = 0;
   bleDeviceCount = 0;
   
-  // WiFi scan (only if enabled)
-  if (paxWifiScanEnabled) {
+  // WiFi scan (only if enabled and not connected to a network)
+  if (paxWifiScanEnabled && WiFi.status() != WL_CONNECTED && !wifiConnecting) {
     if (debugEnabled) {
       Serial.println("PAX: Starting WiFi scan...");
     }
@@ -1557,6 +1607,15 @@ void queueCayenneUplink() {
   if (channelEnabled[9] && paxCounterEnabled) {
     lpp.addAnalogInput(10, static_cast<float>(totalPaxCount));
   }
+  
+  // Channel 11: WiFi IP Address (if connected)
+  // Encode IP as 4 bytes: each octet as analog input scaled 0-255
+  if (wifiConnected) {
+    IPAddress ip = WiFi.localIP();
+    // Encode as single 32-bit value divided by 1000000 to fit in analog range
+    float ipEncoded = (ip[0] * 1000000.0f + ip[1] * 10000.0f + ip[2] * 100.0f + ip[3]) / 1000000.0f;
+    lpp.addAnalogInput(11, ipEncoded);
+  }
 
   // Build log message
   String logMsg = "📡 LoRa uplink #" + String(++uplinkCounter) +
@@ -1674,10 +1733,23 @@ void drawPageGpsFix() {
   display.print(" H:");
   display.println(gps.hdop.isValid() ? String(gps.hdop.hdop(), 1) : "-");
   display.setTextSize(1);
-  display.print("Lat: ");
-  display.println(gps.location.isValid() ? String(gps.location.lat(), 5) : "-");
-  display.print("Lon: ");
-  display.println(gps.location.isValid() ? String(gps.location.lng(), 5) : "-");
+  
+  // Show current GPS if valid, otherwise show last known position
+  if (gps.location.isValid()) {
+    display.print("Lat: ");
+    display.println(String(gps.location.lat(), 5));
+    display.print("Lon: ");
+    display.println(String(gps.location.lng(), 5));
+  } else if (lastGoodLat != 0.0 || lastGoodLon != 0.0) {
+    display.print("Last: ");
+    display.println(String(lastGoodLat, 5));
+    display.print("      ");
+    display.println(String(lastGoodLon, 5));
+  } else {
+    display.print("Lat: -");
+    display.println();
+    display.print("Lon: -");
+  }
 }
 
 // Clock page uses the ESP32 system clock, which is in turn synchronized from
@@ -2144,6 +2216,29 @@ void loadSystemSettings() {
   paxBleScanEnabled = preferences.getBool("paxBleScan", true);
   paxScanInterval = preferences.getUInt("paxInterval", 60) * 1000; // Convert to ms
   
+  // Load GPS path size (5-100, default 20)
+  gpsPathSize = preferences.getUInt("gpsPathSize", 20);
+  if (gpsPathSize < 5) gpsPathSize = 5;
+  if (gpsPathSize > GPS_PATH_MAX_SIZE) gpsPathSize = GPS_PATH_MAX_SIZE;
+  
+  // Load MQTT settings
+  mqttEnabled = preferences.getBool("mqttEnabled", false);
+  mqttServer = preferences.getString("mqttServer", "");
+  mqttPort = preferences.getUShort("mqttPort", 1883);
+  mqttUsername = preferences.getString("mqttUser", "");
+  mqttPassword = preferences.getString("mqttPass", "");
+  mqttTopic = preferences.getString("mqttTopic", "ttgo/sensor");
+  mqttDeviceName = preferences.getString("mqttDevice", "TTGO-T-Beam");
+  mqttPublishInterval = preferences.getULong("mqttInterval", 60000); // Default 60 seconds
+  
+  // Load MQTT payload configuration
+  mqttIncludeTimestamp = preferences.getBool("mqttTime", true);
+  mqttIncludeBME280 = preferences.getBool("mqttBME", true);
+  mqttIncludeGPS = preferences.getBool("mqttGPS", true);
+  mqttIncludeBattery = preferences.getBool("mqttBatt", true);
+  mqttIncludePAX = preferences.getBool("mqttPAX", true);
+  mqttIncludeSystem = preferences.getBool("mqttSys", true);
+  
   // Load last known good GPS position
   lastGoodLat = preferences.getDouble("gpsLat", 0.0);
   lastGoodLon = preferences.getDouble("gpsLon", 0.0);
@@ -2205,17 +2300,198 @@ void saveSystemSettings() {
   preferences.putBool("paxBleScan", paxBleScanEnabled);
   preferences.putUInt("paxInterval", paxScanInterval / 1000); // Convert to seconds
   
+  // Save GPS path size
+  preferences.putUInt("gpsPathSize", gpsPathSize);
+  
+  // Save MQTT settings
+  preferences.putBool("mqttEnabled", mqttEnabled);
+  preferences.putString("mqttServer", mqttServer);
+  preferences.putUShort("mqttPort", mqttPort);
+  preferences.putString("mqttUser", mqttUsername);
+  preferences.putString("mqttPass", mqttPassword);
+  preferences.putString("mqttTopic", mqttTopic);
+  preferences.putString("mqttDevice", mqttDeviceName);
+  preferences.putULong("mqttInterval", mqttPublishInterval);
+  
+  // Save MQTT payload configuration
+  preferences.putBool("mqttTime", mqttIncludeTimestamp);
+  preferences.putBool("mqttBME", mqttIncludeBME280);
+  preferences.putBool("mqttGPS", mqttIncludeGPS);
+  preferences.putBool("mqttBatt", mqttIncludeBattery);
+  preferences.putBool("mqttPAX", mqttIncludePAX);
+  preferences.putBool("mqttSys", mqttIncludeSystem);
+  
   // Save last known good GPS position
   preferences.putDouble("gpsLat", lastGoodLat);
   preferences.putDouble("gpsLon", lastGoodLon);
-  preferences.putDouble("gpsAlt", lastGoodAlt);
-  preferences.putUInt("gpsSats", lastGoodSats);
-  preferences.putDouble("gpsHdop", lastGoodHdop);
-  preferences.putUInt("gpsTime", lastGoodTimestamp);
   
   preferences.end();
+}
+
+// =============================================================================
+// MQTT Functions
+// =============================================================================
+// Author: Markus van Kempen | markus.van.kempen@gmail.com
+//
+// MQTT client for publishing sensor data to MQTT broker
+// =============================================================================
+
+/**
+ * @brief Connect to MQTT broker
+ * 
+ * Attempts to connect to the configured MQTT broker with credentials
+ */
+void connectMQTT() {
+  if (!mqttEnabled || mqttServer.length() == 0) {
+    return;
+  }
   
-  Serial.println("✓ System settings saved to NVS");
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  
+  // Don't attempt reconnection too frequently
+  if (millis() - lastMqttAttempt < mqttReconnectInterval) {
+    return;
+  }
+  
+  lastMqttAttempt = millis();
+  
+  if (mqttClient.connected()) {
+    mqttConnected = true;
+    return;
+  }
+  
+  Serial.println("🔌 Connecting to MQTT broker: " + mqttServer + ":" + String(mqttPort));
+  
+  mqttClient.setServer(mqttServer.c_str(), mqttPort);
+  
+  String clientId = "TTGO-T-Beam-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  
+  bool connected = false;
+  if (mqttUsername.length() > 0) {
+    connected = mqttClient.connect(clientId.c_str(), mqttUsername.c_str(), mqttPassword.c_str());
+  } else {
+    connected = mqttClient.connect(clientId.c_str());
+  }
+  
+  if (connected) {
+    mqttConnected = true;
+    Serial.println("✓ MQTT connected");
+  } else {
+    mqttConnected = false;
+    Serial.print("✗ MQTT connection failed, rc=");
+    Serial.println(mqttClient.state());
+  }
+}
+
+/**
+ * @brief Publish sensor data to MQTT broker in JSON format
+ * 
+ * Publishes all sensor readings, GPS data, and system status to MQTT topic
+ */
+void publishMQTT() {
+  if (!mqttEnabled || !mqttConnected || !mqttClient.connected()) {
+    return;
+  }
+  
+  // Create JSON document
+  JsonDocument doc;
+  
+  // Device info (always include device name)
+  doc["device"] = mqttDeviceName;
+  
+  // Timestamp (optional)
+  if (mqttIncludeTimestamp) {
+    doc["timestamp"] = millis() / 1000;
+  }
+  
+  // BME280 data (optional)
+  if (mqttIncludeBME280 && bmeFound) {
+    JsonObject bme = doc["bme280"].to<JsonObject>();
+    bme["temperature"] = lastTemperature;
+    bme["humidity"] = lastHumidity;
+    bme["pressure"] = lastPressureHpa;
+    bme["altitude"] = lastAltitude;
+  }
+  
+  // GPS data (optional)
+  if (mqttIncludeGPS && gps.location.isValid()) {
+    JsonObject gpsData = doc["gps"].to<JsonObject>();
+    gpsData["latitude"] = gps.location.lat();
+    gpsData["longitude"] = gps.location.lng();
+    gpsData["altitude"] = gps.altitude.meters();
+    gpsData["satellites"] = gps.satellites.value();
+    gpsData["hdop"] = gps.hdop.hdop();
+    gpsData["speed"] = gps.speed.kmph();
+    gpsData["course"] = gps.course.deg();
+  }
+  
+  // Battery (optional)
+  if (mqttIncludeBattery && axpFound) {
+    doc["battery_voltage"] = readBatteryVoltage();
+    doc["battery_charging"] = isBatteryCharging();
+  }
+  
+  // PAX counter (optional)
+  if (mqttIncludePAX && paxCounterEnabled) {
+    JsonObject pax = doc["pax"].to<JsonObject>();
+    pax["wifi"] = wifiDeviceCount;
+    pax["ble"] = bleDeviceCount;
+    pax["total"] = wifiDeviceCount + bleDeviceCount;
+  }
+  
+  // System status (optional)
+  if (mqttIncludeSystem) {
+    JsonObject system = doc["system"].to<JsonObject>();
+    system["uptime"] = millis() / 1000;
+    system["free_heap"] = ESP.getFreeHeap();
+    system["wifi_rssi"] = WiFi.RSSI();
+    system["wifi_ip"] = WiFi.localIP().toString();
+    system["lora_joined"] = loraJoined;
+  }
+  
+  // Serialize to string
+  String payload;
+  serializeJson(doc, payload);
+  
+  // Publish
+  Serial.println("\n📨 MQTT Publishing...");
+  Serial.println("  Topic: " + mqttTopic);
+  Serial.println("  Topic length: " + String(mqttTopic.length()) + " bytes");
+  Serial.println("  Payload size: " + String(payload.length()) + " bytes");
+  Serial.println("  MQTT buffer size: " + String(MQTT_MAX_PACKET_SIZE) + " bytes");
+  Serial.println("  Total packet size: ~" + String(mqttTopic.length() + payload.length() + 10) + " bytes");
+  
+  // Check if payload fits in buffer
+  if ((mqttTopic.length() + payload.length() + 10) > MQTT_MAX_PACKET_SIZE) {
+    Serial.println("⚠️  WARNING: Packet size exceeds MQTT buffer!");
+    Serial.println("  Increase MQTT_MAX_PACKET_SIZE in platformio.ini");
+    Serial.println("  Add: -D MQTT_MAX_PACKET_SIZE=512");
+  }
+  
+  if (debugEnabled || payload.length() > 200) {
+    Serial.println("  Full payload: " + payload);
+  }
+  
+  bool published = mqttClient.publish(mqttTopic.c_str(), payload.c_str());
+  
+  if (published) {
+    mqttPublishCounter++;
+    Serial.println("✓ MQTT published successfully (#" + String(mqttPublishCounter) + ")");
+  } else {
+    Serial.println("✗ MQTT publish failed!");
+    Serial.println("  Error code: " + String(mqttClient.state()));
+    Serial.println("  Connected: " + String(mqttClient.connected() ? "Yes" : "No"));
+    Serial.println("  Broker: " + mqttServer + ":" + String(mqttPort));
+    
+    // Provide helpful troubleshooting
+    if (payload.length() > 128) {
+      Serial.println("\n💡 LIKELY CAUSE: Payload too large for default MQTT buffer (128 bytes)");
+      Serial.println("   SOLUTION: Add to platformio.ini build_flags:");
+      Serial.println("   -D MQTT_MAX_PACKET_SIZE=512");
+    }
+  }
 }
 
 // =============================================================================
@@ -2352,7 +2628,9 @@ String getJsonSensorData() {
  * - Mobile-responsive breakpoints
  */
 String getHtmlPage() {
-  String html = R"rawliteral(
+  static String html;
+  if (html.length() > 0) return html;  // Return cached copy after first build
+  html = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -2487,13 +2765,11 @@ String getHtmlPage() {
       .header h1 { font-size: 1.5em; }
     }
   </style>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
 <body>
   <!-- Navigation Bar -->
   <nav class="navbar">
-    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v2.6.0</span></a>
+    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral( | )rawliteral" + String(BUILD_TIMESTAMP) + R"rawliteral(</span></a>
     <div class="navbar-menu">
       <a href="/" class="nav-link active">📊 Dashboard</a>
       <a href="/settings" class="nav-link">⚙️ Settings</a>
@@ -2501,6 +2777,9 @@ String getHtmlPage() {
       <a href="/payload-info" class="nav-link">📦 Payload</a>
       <a href="/diagnostics" class="nav-link">🔧 Diagnostics</a>
       <a href="/debug" class="nav-link">🖥️ Debug</a>
+      <a href="/ota" class="nav-link">🔄 OTA</a>
+      <a href="/mqtt" class="nav-link">📨 MQTT</a>
+      <a href="/wifi-config" class="nav-link">📡 WiFi</a>
       <a href="/about" class="nav-link">ℹ️ About</a>
     </div>
   </nav>
@@ -2579,21 +2858,43 @@ String getHtmlPage() {
   </div>
 
   <script>
-    let map, marker;
+    let map, marker, pathPolyline;
     
     function initMap() {
-      // Initialize Leaflet map with OpenStreetMap tiles
-      map = L.map('map').setView([0, 0], 2);
+      // Check if Leaflet is available (requires internet connection)
+      if (typeof L === 'undefined') {
+        console.log('Leaflet not available - map disabled (no internet connection)');
+        const mapDiv = document.getElementById('map');
+        if (mapDiv) {
+          mapDiv.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#666;text-align:center;padding:20px;"><div>📡 Map requires internet connection<br><small>Connect to WiFi to view GPS location on map</small></div></div>';
+        }
+        return;
+      }
       
-      // Add OpenStreetMap tile layer
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-        maxZoom: 19
-      }).addTo(map);
-      
-      // Create marker (initially hidden)
-      marker = L.marker([0, 0]).addTo(map);
-      marker.bindPopup('TTGO T-Beam Location');
+      try {
+        // Initialize Leaflet map with OpenStreetMap tiles
+        map = L.map('map').setView([0, 0], 2);
+        
+        // Add OpenStreetMap tile layer
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+          maxZoom: 19
+        }).addTo(map);
+        
+        // Create marker (initially hidden)
+        marker = L.marker([0, 0]).addTo(map);
+        marker.bindPopup('TTGO T-Beam Location');
+        
+        // Create polyline for GPS path (blue line with 50% opacity)
+        pathPolyline = L.polyline([], {
+          color: '#2196F3',
+          weight: 3,
+          opacity: 0.7,
+          smoothFactor: 1
+        }).addTo(map);
+      } catch (error) {
+        console.error('Error initializing map:', error);
+      }
     }
     
     function updateData() {
@@ -2632,22 +2933,49 @@ String getHtmlPage() {
               `Alt: ${data.gps.altitude.toFixed(1)}m | HDOP: ${data.gps.hdop.toFixed(2)} | Speed: ${data.gps.speed.toFixed(1)} km/h`;
             document.getElementById('gpsStatusBadge').innerHTML = '<span class="status online">GPS LOCKED</span>';
             
-            // Update map
-            const latLng = [data.gps.latitude, data.gps.longitude];
-            marker.setLatLng(latLng);
-            map.setView(latLng, 15);
-            marker.setPopupContent(`
-              <b>TTGO T-Beam Location</b><br>
-              Lat: ${lat}<br>
-              Lon: ${lon}<br>
-              Alt: ${data.gps.altitude.toFixed(1)}m<br>
-              Satellites: ${data.gps.satellites}
-            `);
-            marker.openPopup();
+            // Update map (only if Leaflet is available)
+            if (map && marker) {
+              const latLng = [data.gps.latitude, data.gps.longitude];
+              marker.setLatLng(latLng);
+              map.setView(latLng, 15);
+              marker.setPopupContent(`
+                <b>TTGO T-Beam Location</b><br>
+                Lat: ${lat}<br>
+                Lon: ${lon}<br>
+                Alt: ${data.gps.altitude.toFixed(1)}m<br>
+                Satellites: ${data.gps.satellites}
+              `);
+              marker.openPopup();
+              
+              // GPS path is fetched separately every 30s to reduce payload size
+            }
           } else {
-            document.getElementById('gpsCoords').textContent = 'Waiting for GPS fix...';
-            document.getElementById('gpsDetails').textContent = 'Move to open area with clear sky view';
-            document.getElementById('gpsStatusBadge').innerHTML = '<span class="status offline">NO FIX</span>';
+            // No current fix - check if we have last known position
+            if (data.gps.latitude !== 0 && data.gps.longitude !== 0) {
+              // Show last known position
+              const lat = data.gps.latitude.toFixed(6);
+              const lon = data.gps.longitude.toFixed(6);
+              document.getElementById('gpsCoords').textContent = `${lat}, ${lon} (Last Known)`;
+              document.getElementById('gpsDetails').textContent = `Last update: ${data.gps.lastUpdate || 'unknown'}`;
+              document.getElementById('gpsStatusBadge').innerHTML = '<span class="status offline">LAST KNOWN</span>';
+              
+              // Show last known position on map with different marker style
+              const latLng = [data.gps.latitude, data.gps.longitude];
+              marker.setLatLng(latLng);
+              map.setView(latLng, 15);
+              marker.setPopupContent(`
+                <b>Last Known Position</b><br>
+                Lat: ${lat}<br>
+                Lon: ${lon}<br>
+                Last update: ${data.gps.lastUpdate || 'unknown'}<br>
+                <i>Waiting for GPS fix...</i>
+              `);
+              marker.openPopup();
+            } else {
+              document.getElementById('gpsCoords').textContent = 'Waiting for GPS fix...';
+              document.getElementById('gpsDetails').textContent = 'Move to open area with clear sky view';
+              document.getElementById('gpsStatusBadge').innerHTML = '<span class="status offline">NO FIX</span>';
+            }
           }
         })
         .catch(err => console.error('Error fetching data:', err));
@@ -2660,9 +2988,57 @@ String getHtmlPage() {
       return `${days}d ${hours}h ${mins}m`;
     }
     
-    initMap();
+    // Load Leaflet CSS and JS asynchronously with timeout
+    let leafletLoaded = false;
+    
+    // Load CSS first (non-blocking)
+    const leafletCSS = document.createElement('link');
+    leafletCSS.rel = 'stylesheet';
+    leafletCSS.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+    leafletCSS.onerror = function() {
+      console.log('Failed to load Leaflet CSS - continuing without it');
+    };
+    document.head.appendChild(leafletCSS);
+    
+    // Load JS
+    const leafletScript = document.createElement('script');
+    leafletScript.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    leafletScript.async = true;
+    leafletScript.onload = function() {
+      leafletLoaded = true;
+      initMap();
+    };
+    leafletScript.onerror = function() {
+      console.log('Failed to load Leaflet JS - map will be disabled');
+      initMap(); // Call anyway to show message
+    };
+    document.head.appendChild(leafletScript);
+    
+    // Timeout after 2 seconds if Leaflet doesn't load
+    setTimeout(function() {
+      if (!leafletLoaded) {
+        console.log('Leaflet load timeout - continuing without map');
+        initMap(); // Call anyway to show message
+      }
+    }, 2000);
+    
+    // Fetch GPS path separately - it changes slowly, no need to send with every poll
+    function updateGpsPath() {
+      fetch('/api/gps-path')
+        .then(response => response.json())
+        .then(data => {
+          if (pathPolyline && data.path && data.path.length > 0) {
+            const pathCoords = data.path.map(point => [point.lat, point.lon]);
+            pathPolyline.setLatLngs(pathCoords);
+          }
+        })
+        .catch(err => console.error('GPS path fetch error:', err));
+    }
+
     updateData();
-    setInterval(updateData, 1000);
+    setInterval(updateData, 3000);   // Poll sensor data every 3s (was 1s)
+    setInterval(updateGpsPath, 30000); // Poll GPS path every 30s
+    setTimeout(updateGpsPath, 3500);   // First path fetch shortly after load
   </script>
     </div>
   </div>
@@ -2693,21 +3069,51 @@ String getHtmlPage() {
  * @see getJsonSensorData() for API response format
  */
 void setupWebServer() {
-  // Serve main page
+  // Serve main page - with long cache since the HTML is static
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(200, "text/html", getHtmlPage());
+    AsyncWebServerResponse *response = request->beginResponse(200, "text/html", getHtmlPage());
+    response->addHeader("Cache-Control", "public, max-age=3600");
+    request->send(response);
   });
   
-  // API endpoint for JSON data
+  // Alias for main page - /ui redirects to dashboard
+  server.on("/ui", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->redirect("/");
+  });
+  
+  // API endpoint for JSON data - no-cache so browser always fetches fresh values
   server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(200, "application/json", getJsonSensorData());
+    AsyncWebServerResponse *response = request->beginResponse(200, "application/json", getJsonSensorData());
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+  });
+
+  // GPS path endpoint - separate from /api/data to keep the main poll lightweight
+  server.on("/api/gps-path", HTTP_GET, [](AsyncWebServerRequest *request){
+    JsonDocument doc;
+    JsonArray pathArray = doc["path"].to<JsonArray>();
+    for (int i = 0; i < gpsPathCount; i++) {
+      int idx = (gpsPathIndex - gpsPathCount + i + gpsPathSize) % gpsPathSize;
+      if (gpsPath[idx].valid) {
+        JsonObject point = pathArray.add<JsonObject>();
+        point["lat"] = gpsPath[idx].lat;
+        point["lon"] = gpsPath[idx].lon;
+      }
+    }
+    String output;
+    serializeJson(doc, output);
+    AsyncWebServerResponse *response = request->beginResponse(200, "application/json", output);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
   });
   
   // WiFi reset endpoint
   server.on("/reset-wifi", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "text/plain", "WiFi settings will be reset. Device will restart.");
     delay(1000);
-    wifiManager.resetSettings();
+    preferences.begin("wifi", false);
+    preferences.clear();
+    preferences.end();
     ESP.restart();
   });
   
@@ -2885,7 +3291,7 @@ void setupWebServer() {
 <body>
   <!-- Navigation Bar -->
   <nav class="navbar">
-    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v2.6.0</span></a>
+    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></a>
     <div class="navbar-menu">
       <a href="/" class="nav-link">📊 Dashboard</a>
       <a href="/settings" class="nav-link">⚙️ Settings</a>
@@ -2893,6 +3299,9 @@ void setupWebServer() {
       <a href="/payload-info" class="nav-link">📦 Payload</a>
       <a href="/diagnostics" class="nav-link">🔧 Diagnostics</a>
       <a href="/debug" class="nav-link">🖥️ Debug</a>
+      <a href="/ota" class="nav-link">🔄 OTA</a>
+      <a href="/mqtt" class="nav-link">📨 MQTT</a>
+      <a href="/wifi-config" class="nav-link">📡 WiFi</a>
       <a href="/about" class="nav-link">ℹ️ About</a>
     </div>
   </nav>
@@ -3321,7 +3730,9 @@ void setupWebServer() {
   server.on("/api/wifi-reset", HTTP_POST, [](AsyncWebServerRequest *request){
     request->send(200, "application/json", "{\"success\":true,\"message\":\"WiFi settings reset. Restarting...\"}");
     delay(1000);
-    wifiManager.resetSettings();
+    preferences.begin("wifi", false);
+    preferences.clear();
+    preferences.end();
     ESP.restart();
   });
   
@@ -3633,37 +4044,8 @@ void setupWebServer() {
     request->send(200, "application/json", output);
   });
   
-  // WiFi connect API
-  server.on("/api/wifi-connect", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-      JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, data, len);
-      
-      if (error) {
-        request->send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
-        return;
-      }
-      
-      String ssid = doc["ssid"].as<String>();
-      String password = doc["password"].as<String>();
-      
-      // Save credentials using WiFiManager
-      WiFi.begin(ssid.c_str(), password.c_str());
-      
-      // Wait up to 10 seconds for connection
-      int attempts = 0;
-      while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        attempts++;
-      }
-      
-      if (WiFi.status() == WL_CONNECTED) {
-        request->send(200, "application/json", "{\"success\":true,\"message\":\"Connected successfully\"}");
-      } else {
-        request->send(200, "application/json", "{\"success\":false,\"message\":\"Connection timeout\"}");
-      }
-    }
-  );
+  // WiFi connect API (duplicate - will be handled by the non-blocking version below)
+  // This endpoint is kept for compatibility but redirects to the main handler
   
   // System settings/configuration page
   server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -3879,7 +4261,7 @@ void setupWebServer() {
 <body>
   <!-- Navigation Bar -->
   <nav class="navbar">
-    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v2.6.0</span></a>
+    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></a>
     <div class="navbar-menu">
       <a href="/" class="nav-link">📊 Dashboard</a>
       <a href="/settings" class="nav-link active">⚙️ Settings</a>
@@ -3887,6 +4269,9 @@ void setupWebServer() {
       <a href="/payload-info" class="nav-link">📦 Payload</a>
       <a href="/diagnostics" class="nav-link">🔧 Diagnostics</a>
       <a href="/debug" class="nav-link">🖥️ Debug</a>
+      <a href="/ota" class="nav-link">🔄 OTA</a>
+      <a href="/mqtt" class="nav-link">📨 MQTT</a>
+      <a href="/wifi-config" class="nav-link">📡 WiFi</a>
       <a href="/about" class="nav-link">ℹ️ About</a>
     </div>
   </nav>
@@ -3973,6 +4358,14 @@ void setupWebServer() {
           <input type="number" id="sleep-wake-interval" min="60" value="86400">
           <button class="btn btn-primary" onclick="setSleepInterval()">Update Sleep Interval</button>
         </div>
+        <div class="input-group">
+          <label>GPS Path Size (5-100 positions)</label>
+          <input type="number" id="gps-path-size" min="5" max="100" value="20">
+          <button class="btn btn-primary" onclick="setGpsPathSize()">Update GPS Path Size</button>
+          <p style="font-size: 12px; color: #666; margin-top: 5px;">
+            Number of GPS positions to track and display on map (default: 20)
+          </p>
+        </div>
       </div>
       
       <!-- Downlink Commands Reference -->
@@ -4055,6 +4448,7 @@ void setupWebServer() {
           // Update inputs
           document.getElementById('lora-send-interval').value = data.loraInterval;
           document.getElementById('sleep-wake-interval').value = data.sleepInterval;
+          document.getElementById('gps-path-size').value = data.gpsPathSize || 20;
         })
         .catch(error => console.error('Error loading status:', error));
     }
@@ -4087,6 +4481,15 @@ void setupWebServer() {
     function setSleepInterval() {
       const interval = document.getElementById('sleep-wake-interval').value;
       sendCommand('sleep-interval', interval);
+    }
+    
+    function setGpsPathSize() {
+      const size = document.getElementById('gps-path-size').value;
+      if (size < 5 || size > 100) {
+        alert('GPS path size must be between 5 and 100');
+        return;
+      }
+      sendCommand('gps-path-size', size);
     }
     
     function sendCommand(type, value) {
@@ -4131,7 +4534,8 @@ void setupWebServer() {
     json += "\"displayEnabled\":" + String(displayEnabled ? "true" : "false") + ",";
     json += "\"sleepEnabled\":" + String(sleepModeEnabled ? "true" : "false") + ",";
     json += "\"sleepInterval\":" + String(sleepWakeInterval) + ",";
-    json += "\"loraInterval\":" + String(loraSendIntervalSec);
+    json += "\"loraInterval\":" + String(loraSendIntervalSec) + ",";
+    json += "\"gpsPathSize\":" + String(gpsPathSize);
     json += "}";
     request->send(200, "application/json", json);
   });
@@ -4235,6 +4639,18 @@ void setupWebServer() {
         } else {
           response = "{\"success\":false,\"message\":\"Interval must be >= 60 seconds\"}";
         }
+      } else if (type == "gps-path-size") {
+        int size = value.toInt();
+        if (size >= 5 && size <= GPS_PATH_MAX_SIZE) {
+          gpsPathSize = size;
+          // Reset path tracking with new size
+          gpsPathIndex = 0;
+          gpsPathCount = 0;
+          response = "{\"success\":true,\"message\":\"GPS path size updated to " + String(size) + " positions\"}";
+          settingsChanged = true;
+        } else {
+          response = "{\"success\":false,\"message\":\"Path size must be between 5 and " + String(GPS_PATH_MAX_SIZE) + "\"}";
+        }
       }
       
       // Save settings to NVS if any were changed
@@ -4304,7 +4720,13 @@ void setupWebServer() {
     if (axpFound) {
       batteryVoltage = readBatteryVoltage();
     }
-    json += "\"batteryVoltage\":" + String(batteryVoltage, 2);
+    json += "\"batteryVoltage\":" + String(batteryVoltage, 2) + ",";
+    
+    // MQTT status
+    json += "\"mqttEnabled\":" + String(mqttEnabled ? "true" : "false") + ",";
+    json += "\"mqttConnected\":" + String(mqttConnected ? "true" : "false") + ",";
+    json += "\"mqttServer\":\"" + mqttServer + "\",";
+    json += "\"mqttPublishCount\":" + String(mqttPublishCounter);
     json += "}";
     
     request->send(200, "application/json", json);
@@ -4325,6 +4747,64 @@ void setupWebServer() {
     logDebug("⚠️ Frame counter reset to 0 via web UI");
     
     request->send(200, "application/json", json);
+  });
+  
+  // Reboot device API endpoint
+  server.on("/api/reboot", HTTP_POST, [](AsyncWebServerRequest *request){
+    Serial.println("\n╔════════════════════════════════════════════════════════════╗");
+    Serial.println("║ 🔄 DEVICE REBOOT REQUESTED VIA WEB UI                     ║");
+    Serial.println("╚════════════════════════════════════════════════════════════╝");
+    
+    String json = "{\"success\":true,\"message\":\"Device rebooting...\"}";
+    request->send(200, "application/json", json);
+    
+    Serial.println("⏳ Rebooting in 2 seconds...");
+    delay(2000);
+    ESP.restart();
+  });
+  
+  // Factory reset API endpoint
+  server.on("/api/factory-reset", HTTP_POST, [](AsyncWebServerRequest *request){
+    Serial.println("\n╔════════════════════════════════════════════════════════════╗");
+    Serial.println("║ ⚠️  FACTORY RESET REQUESTED VIA WEB UI                     ║");
+    Serial.println("╚════════════════════════════════════════════════════════════╝");
+    Serial.println("⚠️  Erasing all NVS settings...");
+    
+    // Erase all NVS namespaces
+    preferences.begin("system", false);
+    preferences.clear();
+    preferences.end();
+    Serial.println("  ✓ System settings cleared");
+    
+    preferences.begin("lorawan", false);
+    preferences.clear();
+    preferences.end();
+    Serial.println("  ✓ LoRaWAN settings cleared");
+    
+    preferences.begin("mqtt", false);
+    preferences.clear();
+    preferences.end();
+    Serial.println("  ✓ MQTT settings cleared");
+    
+    // Reset WiFi credentials
+    preferences.begin("wifi", false);
+    preferences.clear();
+    preferences.end();
+    Serial.println("  ✓ WiFi credentials cleared");
+    
+    String json = "{\"success\":true,\"message\":\"Factory reset complete. Device will restart in AP mode.\"}";
+    request->send(200, "application/json", json);
+    
+    Serial.println("\n╔════════════════════════════════════════════════════════════╗");
+    Serial.println("║ ✓ FACTORY RESET COMPLETE                                   ║");
+    Serial.println("║   Device will restart in AP mode                           ║");
+    Serial.println("║   SSID: TTGO-T-Beam-Setup                                  ║");
+    Serial.println("║   Password: 12345678                                       ║");
+    Serial.println("╚════════════════════════════════════════════════════════════╝");
+    Serial.println("⏳ Rebooting in 3 seconds...");
+    
+    delay(3000);
+    ESP.restart();
   });
   
   // Channel configuration API - GET
@@ -4636,7 +5116,7 @@ void setupWebServer() {
 <body>
   <!-- Navigation Bar -->
   <nav class="navbar">
-    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v2.6.0</span></a>
+    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></a>
     <div class="navbar-menu">
       <a href="/" class="nav-link">📊 Dashboard</a>
       <a href="/settings" class="nav-link">⚙️ Settings</a>
@@ -4644,6 +5124,9 @@ void setupWebServer() {
       <a href="/payload-info" class="nav-link">📦 Payload</a>
       <a href="/diagnostics" class="nav-link">🔧 Diagnostics</a>
       <a href="/debug" class="nav-link active">🖥️ Debug</a>
+      <a href="/ota" class="nav-link">🔄 OTA</a>
+      <a href="/mqtt" class="nav-link">📨 MQTT</a>
+      <a href="/wifi-config" class="nav-link">📡 WiFi</a>
       <a href="/about" class="nav-link">ℹ️ About</a>
     </div>
   </nav>
@@ -5011,7 +5494,7 @@ void setupWebServer() {
 <body>
   <!-- Navigation Bar -->
   <nav class="navbar">
-    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v2.6.0</span></a>
+    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></a>
     <div class="navbar-menu">
       <a href="/" class="nav-link">📊 Dashboard</a>
       <a href="/settings" class="nav-link">⚙️ Settings</a>
@@ -5019,6 +5502,9 @@ void setupWebServer() {
       <a href="/payload-info" class="nav-link">📦 Payload</a>
       <a href="/diagnostics" class="nav-link active">🔧 Diagnostics</a>
       <a href="/debug" class="nav-link">🖥️ Debug</a>
+      <a href="/ota" class="nav-link">🔄 OTA</a>
+      <a href="/mqtt" class="nav-link">📨 MQTT</a>
+      <a href="/wifi-config" class="nav-link">📡 WiFi</a>
       <a href="/about" class="nav-link">ℹ️ About</a>
     </div>
   </nav>
@@ -5138,17 +5624,88 @@ void setupWebServer() {
       
       <!-- Actions -->
       <h2>⚙️ Maintenance Actions</h2>
-      <div class="button-group">
+      
+      <!-- Frame Counter Reset -->
+      <div style="margin-bottom: 30px;">
+        <h3 style="color: #333; margin-bottom: 10px;">🔄 Reset Frame Counter</h3>
+        <p style="color: #666; font-size: 14px; margin-bottom: 15px;">
+          Resets the LoRaWAN uplink frame counter (LMIC.seqnoUp) to 0. This is useful when:
+        </p>
+        <ul style="color: #666; font-size: 14px; margin-left: 20px; margin-bottom: 15px;">
+          <li>Re-joining the network after a long period</li>
+          <li>Switching between OTAA and ABP modes</li>
+          <li>Network server has lost sync with device counter</li>
+          <li>Instructed by your network administrator</li>
+        </ul>
+        <p style="color: #ff6b6b; font-size: 13px; margin-bottom: 15px;">
+          ⚠️ <strong>Warning:</strong> Only reset if you know what you're doing. Incorrect use may cause uplink failures.
+        </p>
         <button class="btn btn-danger" onclick="resetFrameCounter()">
           🔄 Reset Frame Counter
         </button>
+      </div>
+      
+      <!-- Device Reboot -->
+      <div style="margin-bottom: 30px;">
+        <h3 style="color: #333; margin-bottom: 10px;">🔄 Reboot Device</h3>
+        <p style="color: #666; font-size: 14px; margin-bottom: 15px;">
+          Performs a soft restart of the device. This will:
+        </p>
+        <ul style="color: #666; font-size: 14px; margin-left: 20px; margin-bottom: 15px;">
+          <li>Restart the ESP32 microcontroller</li>
+          <li>Reload all settings from NVS (Non-Volatile Storage)</li>
+          <li>Re-initialize all sensors and peripherals</li>
+          <li>Reconnect to WiFi and LoRaWAN network</li>
+          <li><strong>Preserve all saved settings</strong> (WiFi, LoRa keys, MQTT config, etc.)</li>
+        </ul>
+        <p style="color: #4CAF50; font-size: 13px; margin-bottom: 15px;">
+          ✓ <strong>Safe:</strong> All your configurations will be preserved. The device will be back online in ~30 seconds.
+        </p>
+        <button class="btn btn-warning" onclick="rebootDevice()">
+          🔄 Reboot Device
+        </button>
+      </div>
+      
+      <!-- Factory Reset -->
+      <div style="margin-bottom: 30px;">
+        <h3 style="color: #333; margin-bottom: 10px;">⚠️ Factory Reset</h3>
+        <p style="color: #666; font-size: 14px; margin-bottom: 15px;">
+          Erases ALL saved settings and restarts the device to factory defaults. This will delete:
+        </p>
+        <ul style="color: #666; font-size: 14px; margin-left: 20px; margin-bottom: 15px;">
+          <li><strong>WiFi credentials</strong> - Device will create AP mode for reconfiguration</li>
+          <li><strong>LoRaWAN keys</strong> - Will revert to default keys from code</li>
+          <li><strong>MQTT configuration</strong> - All broker settings will be cleared</li>
+          <li><strong>System settings</strong> - GPS, display, sleep mode, PAX counter settings</li>
+          <li><strong>Payload configuration</strong> - Channel enable/disable states</li>
+        </ul>
+        <p style="color: #ff6b6b; font-size: 13px; margin-bottom: 15px;">
+          ⚠️ <strong>DANGER:</strong> This action cannot be undone! You will need to reconfigure everything from scratch.
+        </p>
+        <p style="color: #666; font-size: 13px; margin-bottom: 15px;">
+          <strong>After factory reset:</strong>
+        </p>
+        <ol style="color: #666; font-size: 13px; margin-left: 20px; margin-bottom: 15px;">
+          <li>Device will restart and create WiFi AP: <code>TTGO-T-Beam-Setup</code></li>
+          <li>Connect to the AP (password: <code>12345678</code>)</li>
+          <li>Configure your WiFi network</li>
+          <li>Access the web dashboard to reconfigure LoRa keys and other settings</li>
+        </ol>
+        <button class="btn btn-danger" onclick="factoryReset()" style="background: #d32f2f;">
+          ⚠️ Factory Reset (Erase All Settings)
+        </button>
+      </div>
+      
+      <!-- Refresh Stats -->
+      <div style="margin-bottom: 20px;">
+        <h3 style="color: #333; margin-bottom: 10px;">♻️ Refresh Statistics</h3>
+        <p style="color: #666; font-size: 14px; margin-bottom: 15px;">
+          Reloads all diagnostic information from the device without making any changes.
+        </p>
         <button class="btn btn-primary" onclick="refreshStats()">
           ♻️ Refresh Statistics
         </button>
       </div>
-      <p style="color: #999; font-size: 14px; margin-top: 10px;">
-        ⚠️ Warning: Resetting the frame counter will set LMIC.seqnoUp to 0. Only do this if instructed by your network administrator or after re-joining the network.
-      </p>
     </div>
     
     <!-- System Health -->
@@ -5185,6 +5742,18 @@ void setupWebServer() {
       <div class="info-row">
         <span class="info-label">Battery Voltage:</span>
         <span class="info-value" id="batteryVoltage">-</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">MQTT Status:</span>
+        <span class="info-value" id="mqttStatus">-</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">MQTT Server:</span>
+        <span class="info-value" id="mqttServer">-</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">MQTT Publishes:</span>
+        <span class="info-value" id="mqttPublishCount">-</span>
       </div>
     </div>
   </div>
@@ -5251,6 +5820,15 @@ void setupWebServer() {
           
           document.getElementById('gpsStatus').textContent = data.gpsEnabled ? '✅ Enabled' : '❌ Disabled';
           document.getElementById('batteryVoltage').textContent = (data.batteryVoltage || 0).toFixed(2) + ' V';
+          
+          // MQTT status
+          let mqttStatusText = '❌ Disabled';
+          if (data.mqttEnabled) {
+            mqttStatusText = data.mqttConnected ? '✅ Connected' : '⚠️ Enabled (Not Connected)';
+          }
+          document.getElementById('mqttStatus').textContent = mqttStatusText;
+          document.getElementById('mqttServer').textContent = data.mqttServer || 'Not configured';
+          document.getElementById('mqttPublishCount').textContent = data.mqttPublishCount || 0;
         })
         .catch(err => {
           console.error('Error fetching diagnostics:', err);
@@ -5278,6 +5856,74 @@ void setupWebServer() {
         .catch(err => {
           console.error('Error resetting frame counter:', err);
           showAlert('❌ Network error while resetting frame counter', true);
+        });
+    }
+    
+    function rebootDevice() {
+      if (!confirm('Reboot the device now?\\n\\nThe device will restart and be back online in ~30 seconds.\\n\\nAll settings will be preserved.')) {
+        return;
+      }
+      
+      showAlert('🔄 Rebooting device... Please wait 30 seconds then refresh the page.');
+      
+      fetch('/api/reboot', {
+        method: 'POST'
+      })
+        .then(response => response.json())
+        .then(data => {
+          if (data.success) {
+            showAlert('✅ Reboot command sent. Device is restarting...');
+            setTimeout(() => {
+              showAlert('⏳ Device is restarting... Refresh the page in a few seconds.');
+            }, 2000);
+          } else {
+            showAlert('❌ Failed to reboot: ' + data.message, true);
+          }
+        })
+        .catch(err => {
+          // This is expected as device will disconnect
+          console.log('Device disconnected (expected during reboot)');
+          showAlert('✅ Reboot initiated. Wait 30 seconds then refresh the page.');
+        });
+    }
+    
+    function factoryReset() {
+      const confirmation1 = confirm('⚠️ FACTORY RESET WARNING ⚠️\\n\\nThis will ERASE ALL SETTINGS including:\\n\\n• WiFi credentials\\n• LoRaWAN keys\\n• MQTT configuration\\n• All system settings\\n\\nAre you ABSOLUTELY SURE?');
+      
+      if (!confirmation1) {
+        return;
+      }
+      
+      const confirmation2 = confirm('⚠️ FINAL WARNING ⚠️\\n\\nThis action CANNOT be undone!\\n\\nYou will need to reconfigure everything from scratch.\\n\\nType YES in the next prompt to proceed.');
+      
+      if (!confirmation2) {
+        return;
+      }
+      
+      const userInput = prompt('Type "RESET" (all caps) to confirm factory reset:');
+      
+      if (userInput !== 'RESET') {
+        showAlert('❌ Factory reset cancelled. Input did not match.', true);
+        return;
+      }
+      
+      showAlert('⚠️ Performing factory reset... Device will restart in AP mode.');
+      
+      fetch('/api/factory-reset', {
+        method: 'POST'
+      })
+        .then(response => response.json())
+        .then(data => {
+          if (data.success) {
+            showAlert('✅ Factory reset complete. Device is restarting in AP mode...\\n\\nConnect to WiFi AP: TTGO-T-Beam-Setup (password: 12345678)');
+          } else {
+            showAlert('❌ Failed to factory reset: ' + data.message, true);
+          }
+        })
+        .catch(err => {
+          // This is expected as device will disconnect
+          console.log('Device disconnected (expected during factory reset)');
+          showAlert('✅ Factory reset initiated. Connect to AP: TTGO-T-Beam-Setup (password: 12345678)');
         });
     }
     
@@ -5454,7 +6100,7 @@ void setupWebServer() {
 <body>
   <!-- Navigation Bar -->
   <nav class="navbar">
-    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v2.6.0</span></a>
+    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></a>
     <div class="navbar-menu">
       <a href="/" class="nav-link">📊 Dashboard</a>
       <a href="/settings" class="nav-link">⚙️ Settings</a>
@@ -5462,6 +6108,9 @@ void setupWebServer() {
       <a href="/payload-info" class="nav-link active">📦 Payload</a>
       <a href="/diagnostics" class="nav-link">🔧 Diagnostics</a>
       <a href="/debug" class="nav-link">🖥️ Debug</a>
+      <a href="/ota" class="nav-link">🔄 OTA</a>
+      <a href="/mqtt" class="nav-link">📨 MQTT</a>
+      <a href="/wifi-config" class="nav-link">📡 WiFi</a>
       <a href="/about" class="nav-link">ℹ️ About</a>
     </div>
   </nav>
@@ -6062,7 +6711,7 @@ function decodeUplink(input) {
 <body>
   <!-- Navigation Bar -->
   <nav class="navbar">
-    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v2.6.0</span></a>
+    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></a>
     <div class="navbar-menu">
       <a href="/" class="nav-link">📊 Dashboard</a>
       <a href="/settings" class="nav-link">⚙️ Settings</a>
@@ -6070,6 +6719,9 @@ function decodeUplink(input) {
       <a href="/payload-info" class="nav-link">📦 Payload</a>
       <a href="/diagnostics" class="nav-link">🔧 Diagnostics</a>
       <a href="/debug" class="nav-link">🖥️ Debug</a>
+      <a href="/ota" class="nav-link">🔄 OTA</a>
+      <a href="/mqtt" class="nav-link">📨 MQTT</a>
+      <a href="/wifi-config" class="nav-link">📡 WiFi</a>
       <a href="/about" class="nav-link active">ℹ️ About</a>
     </div>
   </nav>
@@ -6147,15 +6799,2070 @@ function decodeUplink(input) {
       
       <p style="margin-top: 20px;">
         <strong>License:</strong> Apache License 2.0<br>
-        <strong>Version:</strong> 2.6.0<br>
+        <strong>Version:</strong> )rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(<br>
+        <strong>Build:</strong> )rawliteral" + String(BUILD_TIMESTAMP) + R"rawliteral(<br>
         <strong>Organization:</strong> Research | Floor 7½ 🏢🤏
       </p>
+      
+      <div style="margin-top: 30px; padding-top: 20px; border-top: 2px solid #e0e0e0; text-align: center;">
+        <p style="color: #667eea; font-weight: 600; margin-bottom: 10px;">📧 Contact</p>
+        <p style="margin-bottom: 5px;">
+          <a href="mailto:markus.van.kempen@gmail.com" style="color: #667eea; text-decoration: none;">
+            ✉️ markus.van.kempen@gmail.com
+          </a>
+        </p>
+        <p>
+          <a href="https://markusvankempen.github.io/" target="_blank" style="color: #667eea; text-decoration: none;">
+            🌐 https://markusvankempen.github.io/
+          </a>
+        </p>
+      </div>
     </div>
   </div>
 </body>
 </html>
 )rawliteral";
     request->send(200, "text/html", html);
+  });
+  // OTA Update page - Firmware update via URL or file upload
+  server.on("/ota", HTTP_GET, [](AsyncWebServerRequest *request){
+    Serial.println("📄 Serving /ota page");
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OTA Update - TTGO T-Beam</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      padding: 20px;
+      min-height: 100vh;
+    }
+    .navbar {
+      background: rgba(0, 0, 0, 0.3);
+      backdrop-filter: blur(10px);
+      padding: 15px 20px;
+      border-radius: 15px;
+      margin-bottom: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+    }
+    .navbar-brand {
+      color: white;
+      font-size: 20px;
+      font-weight: bold;
+      text-decoration: none;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .navbar-menu {
+      display: flex;
+      gap: 5px;
+      flex-wrap: wrap;
+    }
+    .nav-link {
+      color: white;
+      text-decoration: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      transition: all 0.3s;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .nav-link:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    .nav-link.active {
+      background: rgba(255, 255, 255, 0.3);
+      font-weight: bold;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    .card {
+      background: white;
+      border-radius: 15px;
+      padding: 30px;
+      margin-bottom: 20px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #333;
+      margin-bottom: 10px;
+      font-size: 32px;
+    }
+    h2 {
+      color: #667eea;
+      margin: 25px 0 15px 0;
+      font-size: 22px;
+    }
+    p {
+      color: #555;
+      line-height: 1.8;
+      margin-bottom: 15px;
+    }
+    .warning {
+      background: #fff3cd;
+      border-left: 4px solid #ffc107;
+      padding: 15px;
+      margin: 20px 0;
+      border-radius: 5px;
+    }
+    .warning strong {
+      color: #856404;
+    }
+    .input-group {
+      margin-bottom: 20px;
+    }
+    .input-group label {
+      display: block;
+      font-weight: bold;
+      margin-bottom: 8px;
+      color: #333;
+    }
+    .input-group input[type="text"],
+    .input-group input[type="file"] {
+      width: 100%;
+      padding: 12px;
+      border: 2px solid #ddd;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    .input-group input:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    .btn {
+      padding: 12px 30px;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+      margin-right: 10px;
+      margin-top: 10px;
+      transition: all 0.3s;
+    }
+    .btn-primary {
+      background: #667eea;
+      color: white;
+    }
+    .btn-primary:hover {
+      background: #5568d3;
+    }
+    .btn-danger {
+      background: #dc3545;
+      color: white;
+    }
+    .btn-danger:hover {
+      background: #c82333;
+    }
+    .btn:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+    }
+    .progress-container {
+      display: none;
+      margin-top: 20px;
+    }
+    .progress-bar {
+      width: 100%;
+      height: 30px;
+      background: #f0f0f0;
+      border-radius: 15px;
+      overflow: hidden;
+      position: relative;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+      width: 0%;
+      transition: width 0.3s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: bold;
+    }
+    .status-message {
+      margin-top: 15px;
+      padding: 15px;
+      border-radius: 8px;
+      display: none;
+    }
+    .status-success {
+      background: #d4edda;
+      color: #155724;
+      border: 1px solid #c3e6cb;
+    }
+    .status-error {
+      background: #f8d7da;
+      color: #721c24;
+      border: 1px solid #f5c6cb;
+    }
+    .status-info {
+      background: #d1ecf1;
+      color: #0c5460;
+      border: 1px solid #bee5eb;
+    }
+    .divider {
+      height: 2px;
+      background: linear-gradient(90deg, transparent, #667eea, transparent);
+      margin: 30px 0;
+    }
+  </style>
+</head>
+<body>
+  <nav class="navbar">
+    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></a>
+    <div class="navbar-menu">
+      <a href="/" class="nav-link">📊 Dashboard</a>
+      <a href="/settings" class="nav-link">⚙️ Settings</a>
+      <a href="/config" class="nav-link">🔐 LoRa Config</a>
+      <a href="/payload-info" class="nav-link">📦 Payload</a>
+      <a href="/diagnostics" class="nav-link">🔧 Diagnostics</a>
+      <a href="/debug" class="nav-link">🖥️ Debug</a>
+      <a href="/ota" class="nav-link active">🔄 OTA</a>
+      <a href="/mqtt" class="nav-link">📨 MQTT</a>
+      <a href="/wifi-config" class="nav-link">📡 WiFi</a>
+      <a href="/about" class="nav-link">ℹ️ About</a>
+    </div>
+  </nav>
+
+  <div class="container">
+    <div class="card">
+      <h1>🔄 OTA Firmware Update</h1>
+      <p>Update device firmware over-the-air via URL or file upload</p>
+      
+      <div class="warning">
+        <strong>⚠️ Warning:</strong> Device will restart after successful update. Ensure stable power supply and WiFi connection. Do not power off during update!
+      </div>
+
+      <!-- Update from URL -->
+      <h2>📥 Update from URL</h2>
+      <p>Provide a direct URL to a .bin firmware file (HTTP/HTTPS)</p>
+      <div class="input-group">
+        <label>Firmware URL</label>
+        <input type="text" id="firmware-url" placeholder="https://example.com/firmware.bin">
+      </div>
+      <button class="btn btn-primary" onclick="updateFromURL()">🌐 Update from URL</button>
+
+      <div class="divider"></div>
+
+      <!-- Update from File -->
+      <h2>📤 Update from File</h2>
+      <p>Upload a .bin firmware file from your computer</p>
+      <div class="input-group">
+        <label>Select Firmware File (.bin)</label>
+        <input type="file" id="firmware-file" accept=".bin">
+      </div>
+      <button class="btn btn-primary" onclick="updateFromFile()">📁 Upload & Update</button>
+
+      <!-- Progress Bar -->
+      <div class="progress-container" id="progress-container">
+        <h3 style="margin-bottom: 10px;">Update Progress</h3>
+        <div class="progress-bar">
+          <div class="progress-fill" id="progress-fill">0%</div>
+        </div>
+        <p id="progress-text" style="margin-top: 10px; text-align: center; color: #667eea; font-weight: bold;">Initializing...</p>
+      </div>
+
+      <!-- Status Messages -->
+      <div class="status-message" id="status-message"></div>
+    </div>
+  </div>
+
+  <script>
+    let updateInProgress = false;
+
+    function showProgress() {
+      document.getElementById('progress-container').style.display = 'block';
+      document.getElementById('status-message').style.display = 'none';
+    }
+
+    function hideProgress() {
+      document.getElementById('progress-container').style.display = 'none';
+    }
+
+    function updateProgress(percent, text) {
+      const fill = document.getElementById('progress-fill');
+      const progressText = document.getElementById('progress-text');
+      fill.style.width = percent + '%';
+      fill.textContent = percent + '%';
+      if (text) progressText.textContent = text;
+    }
+
+    function showStatus(message, type) {
+      const statusDiv = document.getElementById('status-message');
+      statusDiv.className = 'status-message status-' + type;
+      statusDiv.textContent = message;
+      statusDiv.style.display = 'block';
+    }
+
+    function updateFromURL() {
+      if (updateInProgress) {
+        alert('Update already in progress!');
+        return;
+      }
+
+      const url = document.getElementById('firmware-url').value.trim();
+      if (!url) {
+        alert('Please enter a firmware URL');
+        return;
+      }
+
+      if (!url.endsWith('.bin')) {
+        alert('URL must point to a .bin file');
+        return;
+      }
+
+      if (!confirm('Start OTA update from URL?\n\nDevice will restart after update.\n\nURL: ' + url)) {
+        return;
+      }
+
+      updateInProgress = true;
+      showProgress();
+      updateProgress(0, 'Connecting to server...');
+
+      fetch('/api/ota-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: url })
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          updateProgress(100, 'Update initiated!');
+          showStatus('✓ Update started successfully. Device will restart in a few seconds...', 'success');
+          setTimeout(() => {
+            showStatus('Device is restarting... Please wait 30 seconds then refresh the page.', 'info');
+          }, 3000);
+        } else {
+          hideProgress();
+          showStatus('✗ Update failed: ' + data.message, 'error');
+          updateInProgress = false;
+        }
+      })
+      .catch(error => {
+        hideProgress();
+        showStatus('✗ Error: ' + error.message, 'error');
+        updateInProgress = false;
+      });
+    }
+
+    function updateFromFile() {
+      if (updateInProgress) {
+        alert('Update already in progress!');
+        return;
+      }
+
+      const fileInput = document.getElementById('firmware-file');
+      const file = fileInput.files[0];
+      
+      if (!file) {
+        alert('Please select a firmware file');
+        return;
+      }
+
+      if (!file.name.endsWith('.bin')) {
+        alert('File must be a .bin firmware file');
+        return;
+      }
+
+      if (!confirm('Upload and install firmware?\n\nDevice will restart after update.\n\nFile: ' + file.name + '\nSize: ' + (file.size / 1024).toFixed(2) + ' KB')) {
+        return;
+      }
+
+      updateInProgress = true;
+      showProgress();
+      updateProgress(0, 'Uploading firmware...');
+
+      const formData = new FormData();
+      formData.append('firmware', file);
+
+      const xhr = new XMLHttpRequest();
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          const percent = Math.round((e.loaded / e.total) * 100);
+          updateProgress(percent, 'Uploading: ' + percent + '%');
+        }
+      });
+
+      xhr.addEventListener('load', () => {
+        if (xhr.status === 200) {
+          try {
+            const data = JSON.parse(xhr.responseText);
+            if (data.success) {
+              updateProgress(100, 'Update complete!');
+              showStatus('✓ Firmware uploaded successfully. Device is restarting...', 'success');
+              setTimeout(() => {
+                showStatus('Device is restarting... Please wait 30 seconds then refresh the page.', 'info');
+              }, 3000);
+            } else {
+              hideProgress();
+              let errorMsg = '✗ Update failed: ' + data.message;
+              if (data.error_code) {
+                errorMsg += ' (Error code: ' + data.error_code + ')';
+              }
+              if (data.details) {
+                errorMsg += '\\n\\nDetails: ' + data.details;
+              }
+              showStatus(errorMsg, 'error');
+              console.error('OTA Update Error:', data);
+              updateInProgress = false;
+            }
+          } catch (e) {
+            hideProgress();
+            showStatus('✗ Error parsing response: ' + e.message, 'error');
+            console.error('Parse error:', e);
+            updateInProgress = false;
+          }
+        } else {
+          hideProgress();
+          showStatus('✗ Upload failed with HTTP status: ' + xhr.status + '\\n\\nCheck Serial Monitor for details.', 'error');
+          console.error('HTTP Error:', xhr.status, xhr.statusText);
+          updateInProgress = false;
+        }
+      });
+
+      xhr.addEventListener('error', () => {
+        hideProgress();
+        showStatus('✗ Upload error occurred. Device may have restarted.\\n\\nCheck Serial Monitor for details.', 'error');
+        console.error('XHR Error');
+        updateInProgress = false;
+      });
+
+      xhr.addEventListener('abort', () => {
+        hideProgress();
+        showStatus('✗ Upload aborted', 'error');
+        console.error('XHR Aborted');
+        updateInProgress = false;
+      });
+
+      xhr.addEventListener('timeout', () => {
+        hideProgress();
+        showStatus('✗ Upload timeout. Device may be processing the update.\\n\\nWait 30 seconds then refresh.', 'error');
+        console.error('XHR Timeout');
+        updateInProgress = false;
+      });
+
+      xhr.open('POST', '/api/ota-upload');
+      xhr.send(formData);
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+    request->send(200, "text/html", html);
+  });
+
+  // OTA Update from URL endpoint
+  server.on("/api/ota-url", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      String body = "";
+      for (size_t i = 0; i < len; i++) {
+        body += (char)data[i];
+      }
+      
+      // Parse JSON to get URL
+      int urlStart = body.indexOf("\"url\":\"") + 7;
+      int urlEnd = body.indexOf("\"", urlStart);
+      String firmwareURL = "";
+      if (urlStart > 6 && urlEnd > urlStart) {
+        firmwareURL = body.substring(urlStart, urlEnd);
+      }
+      
+      if (firmwareURL.length() == 0) {
+        request->send(200, "application/json", "{\"success\":false,\"message\":\"No URL provided\"}");
+        return;
+      }
+      
+      Serial.println("🔄 OTA Update from URL: " + firmwareURL);
+      
+      // Perform OTA update in background
+      HTTPClient http;
+      http.begin(firmwareURL);
+      int httpCode = http.GET();
+      
+      if (httpCode == HTTP_CODE_OK) {
+        int contentLength = http.getSize();
+        bool canBegin = Update.begin(contentLength);
+        
+        if (canBegin) {
+          Serial.println("✓ OTA update started, size: " + String(contentLength));
+          WiFiClient * stream = http.getStreamPtr();
+          size_t written = Update.writeStream(*stream);
+          
+          if (written == contentLength) {
+            Serial.println("✓ Written : " + String(written) + " successfully");
+          } else {
+            Serial.println("✗ Written only : " + String(written) + "/" + String(contentLength));
+          }
+          
+          if (Update.end()) {
+            if (Update.isFinished()) {
+              Serial.println("✓ OTA update completed successfully!");
+              request->send(200, "application/json", "{\"success\":true,\"message\":\"Update successful, restarting...\"}");
+              delay(1000);
+              ESP.restart();
+            } else {
+              Serial.println("✗ OTA update not finished");
+              request->send(200, "application/json", "{\"success\":false,\"message\":\"Update not finished\"}");
+            }
+          } else {
+            Serial.println("✗ Error Occurred. Error #: " + String(Update.getError()));
+            request->send(200, "application/json", "{\"success\":false,\"message\":\"Update error: " + String(Update.getError()) + "\"}");
+          }
+        } else {
+          Serial.println("✗ Not enough space to begin OTA");
+          request->send(200, "application/json", "{\"success\":false,\"message\":\"Not enough space\"}");
+        }
+      } else {
+        Serial.println("✗ HTTP error: " + String(httpCode));
+        request->send(200, "application/json", "{\"success\":false,\"message\":\"HTTP error: " + String(httpCode) + "\"}");
+      }
+      http.end();
+    }
+  );
+
+  // MQTT Configuration page
+  server.on("/mqtt", HTTP_GET, [](AsyncWebServerRequest *request){
+    Serial.println("📄 Serving /mqtt page");
+    
+    String mqttServerVal = mqttServer.length() > 0 ? mqttServer : "";
+    String mqttUserVal = mqttUsername.length() > 0 ? mqttUsername : "";
+    String mqttTopicVal = mqttTopic.length() > 0 ? mqttTopic : "ttgo/sensor";
+    
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MQTT Config - TTGO T-Beam</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      padding: 20px;
+      min-height: 100vh;
+    }
+    .navbar {
+      background: rgba(0, 0, 0, 0.3);
+      backdrop-filter: blur(10px);
+      padding: 15px 20px;
+      border-radius: 15px;
+      margin-bottom: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+    }
+    .navbar-brand {
+      color: white;
+      font-size: 20px;
+      font-weight: bold;
+      text-decoration: none;
+    }
+    .navbar-menu {
+      display: flex;
+      gap: 5px;
+      flex-wrap: wrap;
+    }
+    .nav-link {
+      color: white;
+      text-decoration: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      transition: all 0.3s;
+      font-size: 14px;
+    }
+    .nav-link:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    .nav-link.active {
+      background: rgba(255, 255, 255, 0.3);
+      font-weight: bold;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    .card {
+      background: white;
+      border-radius: 15px;
+      padding: 30px;
+      margin-bottom: 20px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #333;
+      margin-bottom: 10px;
+      font-size: 32px;
+    }
+    h2 {
+      color: #667eea;
+      margin: 25px 0 15px 0;
+      font-size: 22px;
+    }
+    p {
+      color: #555;
+      line-height: 1.8;
+      margin-bottom: 15px;
+    }
+    .status-badge {
+      display: inline-block;
+      padding: 5px 15px;
+      border-radius: 20px;
+      font-size: 14px;
+      font-weight: bold;
+      margin-left: 10px;
+    }
+    .status-on {
+      background: #d4edda;
+      color: #155724;
+    }
+    .status-off {
+      background: #f8d7da;
+      color: #721c24;
+    }
+    .input-group {
+      margin-bottom: 20px;
+    }
+    .input-group label {
+      display: block;
+      font-weight: bold;
+      margin-bottom: 8px;
+      color: #333;
+    }
+    .input-group input {
+      width: 100%;
+      padding: 12px;
+      border: 2px solid #ddd;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    .input-group input:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    .input-group small {
+      display: block;
+      margin-top: 5px;
+      color: #666;
+      font-size: 12px;
+    }
+    .toggle-switch {
+      position: relative;
+      width: 60px;
+      height: 30px;
+      display: inline-block;
+    }
+    .toggle-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #ccc;
+      transition: .4s;
+      border-radius: 30px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 22px;
+      width: 22px;
+      left: 4px;
+      bottom: 4px;
+      background-color: white;
+      transition: .4s;
+      border-radius: 50%;
+    }
+    input:checked + .slider {
+      background-color: #667eea;
+    }
+    input:checked + .slider:before {
+      transform: translateX(30px);
+    }
+    .btn {
+      padding: 12px 30px;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+      margin-right: 10px;
+      margin-top: 10px;
+      transition: all 0.3s;
+    }
+    .btn-primary {
+      background: #667eea;
+      color: white;
+    }
+    .btn-primary:hover {
+      background: #5568d3;
+    }
+    .btn-success {
+      background: #28a745;
+      color: white;
+    }
+    .btn-success:hover {
+      background: #218838;
+    }
+    .info-box {
+      background: #e7f3ff;
+      border-left: 4px solid #2196F3;
+      padding: 15px;
+      margin: 20px 0;
+      border-radius: 5px;
+    }
+  </style>
+</head>
+<body>
+  <nav class="navbar">
+    <a href="/" class="navbar-brand">🛰️ TTGO T-Beam <span style="font-size: 0.8em; opacity: 0.8;">v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></a>
+    <div class="navbar-menu">
+      <a href="/" class="nav-link">📊 Dashboard</a>
+      <a href="/settings" class="nav-link">⚙️ Settings</a>
+      <a href="/config" class="nav-link">🔐 LoRa Config</a>
+      <a href="/payload-info" class="nav-link">📦 Payload</a>
+      <a href="/diagnostics" class="nav-link">🔧 Diagnostics</a>
+      <a href="/debug" class="nav-link">🖥️ Debug</a>
+      <a href="/ota" class="nav-link">🔄 OTA</a>
+      <a href="/mqtt" class="nav-link active">📨 MQTT</a>
+      <a href="/wifi-config" class="nav-link">📡 WiFi</a>
+      <a href="/about" class="nav-link">ℹ️ About</a>
+    </div>
+  </nav>
+
+  <div class="container">
+    <div class="card">
+      <h1>📨 MQTT Configuration</h1>
+      <p>Configure MQTT broker to publish sensor data in JSON format</p>
+      
+      <div style="margin: 20px 0;">
+        <label style="display: flex; align-items: center; gap: 10px;">
+          <span style="font-weight: bold;">MQTT Enabled:</span>
+          <label class="toggle-switch">
+            <input type="checkbox" id="mqtt-enabled" onchange="toggleMQTT(this.checked)">
+            <span class="slider"></span>
+          </label>
+          <span id="mqtt-status" class="status-badge status-off">OFF</span>
+        </label>
+      </div>
+
+      <h2>🔧 Broker Settings</h2>
+      <div class="input-group">
+        <label>MQTT Broker Server</label>
+        <input type="text" id="mqtt-server" placeholder="mqtt.example.com or 192.168.1.100" value=")rawliteral" + mqttServerVal + R"rawliteral(">
+        <small>Hostname or IP address of MQTT broker</small>
+      </div>
+
+      <div class="input-group">
+        <label>Port</label>
+        <input type="number" id="mqtt-port" value=")rawliteral" + String(mqttPort) + R"rawliteral(" min="1" max="65535">
+        <small>Default: 1883 (unencrypted), 8883 (TLS)</small>
+      </div>
+
+      <div class="input-group">
+        <label>Username (optional)</label>
+        <input type="text" id="mqtt-username" placeholder="Leave empty if no auth required" value=")rawliteral" + mqttUserVal + R"rawliteral(">
+      </div>
+
+      <div class="input-group">
+        <label>Password (optional)</label>
+        <input type="password" id="mqtt-password" placeholder="Leave empty if no auth required">
+        <small>Password is stored securely in NVS</small>
+      </div>
+
+      <div class="input-group">
+        <label>Topic</label>
+        <input type="text" id="mqtt-topic" value=")rawliteral" + mqttTopicVal + R"rawliteral(">
+        <small>MQTT topic to publish sensor data (e.g., ttgo/sensor, home/sensors/outdoor)</small>
+      </div>
+
+      <div class="input-group">
+        <label>Device Name</label>
+        <input type="text" id="mqtt-device-name" value=")rawliteral" + mqttDeviceName + R"rawliteral(">
+        <small>Device identifier in JSON payload (default: TTGO-T-Beam)</small>
+      </div>
+
+      <div class="input-group">
+        <label>Publish Interval (seconds)</label>
+        <input type="number" id="mqtt-interval" value=")rawliteral" + String(mqttPublishInterval / 1000) + R"rawliteral(" min="5" max="3600">
+        <small>How often to publish MQTT messages (5-3600 seconds, default: 60)</small>
+      </div>
+
+      <h2>📦 Payload Content</h2>
+      <p style="color: #666; margin-bottom: 15px;">Select which data to include in MQTT messages</p>
+      
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px;">
+        <label style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #f8f9fa; border-radius: 8px; cursor: pointer;">
+          <input type="checkbox" id="mqtt-include-timestamp" checked style="width: 20px; height: 20px;">
+          <span>⏰ Timestamp</span>
+        </label>
+        <label style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #f8f9fa; border-radius: 8px; cursor: pointer;">
+          <input type="checkbox" id="mqtt-include-bme280" checked style="width: 20px; height: 20px;">
+          <span>🌡️ BME280 Sensor</span>
+        </label>
+        <label style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #f8f9fa; border-radius: 8px; cursor: pointer;">
+          <input type="checkbox" id="mqtt-include-gps" checked style="width: 20px; height: 20px;">
+          <span>📍 GPS Data</span>
+        </label>
+        <label style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #f8f9fa; border-radius: 8px; cursor: pointer;">
+          <input type="checkbox" id="mqtt-include-battery" checked style="width: 20px; height: 20px;">
+          <span>🔋 Battery Info</span>
+        </label>
+        <label style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #f8f9fa; border-radius: 8px; cursor: pointer;">
+          <input type="checkbox" id="mqtt-include-pax" checked style="width: 20px; height: 20px;">
+          <span>👥 PAX Counter</span>
+        </label>
+        <label style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #f8f9fa; border-radius: 8px; cursor: pointer;">
+          <input type="checkbox" id="mqtt-include-system" checked style="width: 20px; height: 20px;">
+          <span>💻 System Status</span>
+        </label>
+      </div>
+
+      <button class="btn btn-primary" onclick="saveMQTTConfig()">💾 Save Configuration</button>
+      <button class="btn btn-success" onclick="testMQTT()">🧪 Test Connection</button>
+      <button class="btn btn-warning" onclick="sendTestMessage()">📤 Send Test Message</button>
+
+      <div class="info-box">
+        <h3 style="margin-top: 0; color: #2196F3;">📋 JSON Payload Format</h3>
+        <p>Sensor data is published in JSON format with the following structure:</p>
+        <pre style="background: #f5f5f5; padding: 10px; border-radius: 5px; overflow-x: auto; font-size: 12px;">{
+  "device": "TTGO-T-Beam",
+  "timestamp": 12345,
+  "bme280": {
+    "temperature": 22.5,
+    "humidity": 45.2,
+    "pressure": 1013.25,
+    "altitude": 123.4
+  },
+  "gps": {
+    "latitude": 51.5074,
+    "longitude": -0.1278,
+    "altitude": 11.0,
+    "satellites": 8,
+    "hdop": 1.2,
+    "speed": 0.0,
+    "course": 0.0
+  },
+  "battery_voltage": 4.1,
+  "battery_current": 150,
+  "battery_charging": true,
+  "pax": {
+    "wifi": 5,
+    "ble": 3,
+    "total": 8
+  },
+  "system": {
+    "uptime": 3600,
+    "free_heap": 180000,
+    "wifi_rssi": -45,
+    "lora_joined": true
+  }
+}</pre>
+      </div>
+
+      <div id="status-message" style="display: none; margin-top: 20px; padding: 15px; border-radius: 8px;"></div>
+    </div>
+  </div>
+
+  <script>
+    function loadStatus() {
+      fetch('/api/mqtt-config')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('mqtt-enabled').checked = data.enabled;
+          document.getElementById('mqtt-status').textContent = data.enabled ? 'ON' : 'OFF';
+          document.getElementById('mqtt-status').className = 'status-badge ' + (data.enabled ? 'status-on' : 'status-off');
+          document.getElementById('mqtt-server').value = data.server || '';
+          document.getElementById('mqtt-port').value = data.port || 1883;
+          document.getElementById('mqtt-username').value = data.username || '';
+          document.getElementById('mqtt-topic').value = data.topic || 'ttgo/sensor';
+          document.getElementById('mqtt-device-name').value = data.deviceName || 'TTGO-T-Beam';
+          document.getElementById('mqtt-interval').value = data.publishInterval || 60;
+          
+          // Load payload content settings
+          document.getElementById('mqtt-include-timestamp').checked = data.includeTimestamp !== false;
+          document.getElementById('mqtt-include-bme280').checked = data.includeBME280 !== false;
+          document.getElementById('mqtt-include-gps').checked = data.includeGPS !== false;
+          document.getElementById('mqtt-include-battery').checked = data.includeBattery !== false;
+          document.getElementById('mqtt-include-pax').checked = data.includePAX !== false;
+          document.getElementById('mqtt-include-system').checked = data.includeSystem !== false;
+        })
+        .catch(error => console.error('Error loading MQTT config:', error));
+    }
+
+    function toggleMQTT(enabled) {
+      fetch('/api/mqtt-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'toggle', enabled: enabled })
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          showStatus('✓ MQTT ' + (enabled ? 'enabled' : 'disabled'), 'success');
+          loadStatus();
+        } else {
+          showStatus('✗ Failed to toggle MQTT', 'error');
+        }
+      })
+      .catch(error => showStatus('✗ Error: ' + error.message, 'error'));
+    }
+
+    function saveMQTTConfig() {
+      const config = {
+        action: 'save',
+        server: document.getElementById('mqtt-server').value,
+        port: parseInt(document.getElementById('mqtt-port').value),
+        username: document.getElementById('mqtt-username').value,
+        password: document.getElementById('mqtt-password').value,
+        topic: document.getElementById('mqtt-topic').value,
+        deviceName: document.getElementById('mqtt-device-name').value,
+        publishInterval: parseInt(document.getElementById('mqtt-interval').value),
+        includeTimestamp: document.getElementById('mqtt-include-timestamp').checked,
+        includeBME280: document.getElementById('mqtt-include-bme280').checked,
+        includeGPS: document.getElementById('mqtt-include-gps').checked,
+        includeBattery: document.getElementById('mqtt-include-battery').checked,
+        includePAX: document.getElementById('mqtt-include-pax').checked,
+        includeSystem: document.getElementById('mqtt-include-system').checked
+      };
+
+      if (!config.server) {
+        showStatus('✗ Please enter MQTT broker server', 'error');
+        return;
+      }
+
+      fetch('/api/mqtt-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(config)
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          showStatus('✓ MQTT configuration saved successfully', 'success');
+          document.getElementById('mqtt-password').value = ''; // Clear password field
+        } else {
+          showStatus('✗ Failed to save configuration: ' + data.message, 'error');
+        }
+      })
+      .catch(error => showStatus('✗ Error: ' + error.message, 'error'));
+    }
+
+    function testMQTT() {
+      showStatus('🔄 Testing MQTT connection...', 'info');
+      
+      // Send current form values for testing without saving
+      const testConfig = {
+        server: document.getElementById('mqtt-server').value,
+        port: parseInt(document.getElementById('mqtt-port').value),
+        username: document.getElementById('mqtt-username').value,
+        password: document.getElementById('mqtt-password').value
+      };
+      
+      if (!testConfig.server) {
+        showStatus('✗ Please enter MQTT broker server', 'error');
+        return;
+      }
+      
+      fetch('/api/mqtt-test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(testConfig)
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          showStatus('✓ MQTT connection successful!', 'success');
+        } else {
+          showStatus('✗ MQTT connection failed: ' + data.message, 'error');
+        }
+      })
+      .catch(error => showStatus('✗ Error: ' + error.message, 'error'));
+    }
+
+    function sendTestMessage() {
+      showStatus('📤 Sending test MQTT message...', 'info');
+      
+      fetch('/api/mqtt-publish', {
+        method: 'POST'
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          showStatus('✓ Test message sent successfully! Check your MQTT broker.', 'success');
+        } else {
+          showStatus('✗ Failed to send test message: ' + data.message, 'error');
+        }
+      })
+      .catch(error => showStatus('✗ Error: ' + error.message, 'error'));
+    }
+
+    function showStatus(message, type) {
+      const statusDiv = document.getElementById('status-message');
+      statusDiv.textContent = message;
+      statusDiv.style.display = 'block';
+      
+      if (type === 'success') {
+        statusDiv.style.background = '#d4edda';
+        statusDiv.style.color = '#155724';
+        statusDiv.style.border = '1px solid #c3e6cb';
+      } else if (type === 'error') {
+        statusDiv.style.background = '#f8d7da';
+        statusDiv.style.color = '#721c24';
+        statusDiv.style.border = '1px solid #f5c6cb';
+      } else {
+        statusDiv.style.background = '#d1ecf1';
+        statusDiv.style.color = '#0c5460';
+        statusDiv.style.border = '1px solid #bee5eb';
+      }
+    }
+
+    // Load status on page load
+    loadStatus();
+  </script>
+</body>
+</html>
+)rawliteral";
+    request->send(200, "text/html", html);
+  });
+
+  // MQTT Configuration API endpoints
+  server.on("/api/mqtt-config", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json = "{";
+    json += "\"enabled\":" + String(mqttEnabled ? "true" : "false") + ",";
+    json += "\"server\":\"" + mqttServer + "\",";
+    json += "\"port\":" + String(mqttPort) + ",";
+    json += "\"username\":\"" + mqttUsername + "\",";
+    json += "\"topic\":\"" + mqttTopic + "\",";
+    json += "\"deviceName\":\"" + mqttDeviceName + "\",";
+    json += "\"publishInterval\":" + String(mqttPublishInterval / 1000) + ",";
+    json += "\"connected\":" + String(mqttConnected ? "true" : "false") + ",";
+    json += "\"publish_count\":" + String(mqttPublishCounter) + ",";
+    json += "\"includeTimestamp\":" + String(mqttIncludeTimestamp ? "true" : "false") + ",";
+    json += "\"includeBME280\":" + String(mqttIncludeBME280 ? "true" : "false") + ",";
+    json += "\"includeGPS\":" + String(mqttIncludeGPS ? "true" : "false") + ",";
+    json += "\"includeBattery\":" + String(mqttIncludeBattery ? "true" : "false") + ",";
+    json += "\"includePAX\":" + String(mqttIncludePAX ? "true" : "false") + ",";
+    json += "\"includeSystem\":" + String(mqttIncludeSystem ? "true" : "false");
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  server.on("/api/mqtt-config", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      String body = "";
+      for (size_t i = 0; i < len; i++) {
+        body += (char)data[i];
+      }
+      
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, body);
+      
+      if (error) {
+        request->send(200, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
+        return;
+      }
+      
+      String action = doc["action"] | "";
+      
+      if (action == "toggle") {
+        mqttEnabled = doc["enabled"] | false;
+        saveSystemSettings();
+        request->send(200, "application/json", "{\"success\":true}");
+      } else if (action == "save") {
+        mqttServer = doc["server"] | "";
+        mqttPort = doc["port"] | 1883;
+        mqttUsername = doc["username"] | "";
+        String password = doc["password"] | "";
+        if (password.length() > 0) {
+          mqttPassword = password;
+        }
+        mqttTopic = doc["topic"] | "ttgo/sensor";
+        mqttDeviceName = doc["deviceName"] | "TTGO-T-Beam";
+        mqttPublishInterval = (doc["publishInterval"] | 60) * 1000; // Convert seconds to milliseconds
+        
+        // Save payload content configuration
+        mqttIncludeTimestamp = doc["includeTimestamp"] | true;
+        mqttIncludeBME280 = doc["includeBME280"] | true;
+        mqttIncludeGPS = doc["includeGPS"] | true;
+        mqttIncludeBattery = doc["includeBattery"] | true;
+        mqttIncludePAX = doc["includePAX"] | true;
+        mqttIncludeSystem = doc["includeSystem"] | true;
+        
+        saveSystemSettings();
+        
+        // Reconnect with new settings
+        if (mqttEnabled) {
+          mqttClient.disconnect();
+          mqttConnected = false;
+          connectMQTT();
+        }
+        
+        request->send(200, "application/json", "{\"success\":true}");
+      } else {
+        request->send(200, "application/json", "{\"success\":false,\"message\":\"Unknown action\"}");
+      }
+    }
+  );
+
+  server.on("/api/mqtt-test", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      String body = "";
+      for (size_t i = 0; i < len; i++) {
+        body += (char)data[i];
+      }
+      
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, body);
+      
+      if (error) {
+        request->send(200, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
+        return;
+      }
+      
+      // Use form values for testing
+      String testServer = doc["server"] | "";
+      uint16_t testPort = doc["port"] | 1883;
+      String testUsername = doc["username"] | "";
+      String testPassword = doc["password"] | "";
+      
+      if (testServer.length() == 0) {
+        request->send(200, "application/json", "{\"success\":false,\"message\":\"No MQTT server provided\"}");
+        return;
+      }
+      
+      // Test connection with provided values
+      WiFiClient testWifiClient;
+      PubSubClient testClient(testWifiClient);
+      testClient.setServer(testServer.c_str(), testPort);
+      
+      String clientId = "TTGO-Test-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+      bool connected = false;
+      
+      if (testUsername.length() > 0) {
+        connected = testClient.connect(clientId.c_str(), testUsername.c_str(), testPassword.c_str());
+      } else {
+        connected = testClient.connect(clientId.c_str());
+      }
+      
+      if (connected) {
+        testClient.disconnect();
+        request->send(200, "application/json", "{\"success\":true,\"message\":\"Connection successful!\"}");
+      } else {
+        String msg = "Connection failed (code: " + String(testClient.state()) + ")";
+        request->send(200, "application/json", "{\"success\":false,\"message\":\"" + msg + "\"}");
+      }
+    }
+  );
+
+  // MQTT Publish Test Message endpoint
+  server.on("/api/mqtt-publish", HTTP_POST, [](AsyncWebServerRequest *request){
+    Serial.println("\n📤 Manual MQTT publish requested via web UI");
+    
+    if (!mqttEnabled) {
+      request->send(200, "application/json", "{\"success\":false,\"message\":\"MQTT is disabled\"}");
+      return;
+    }
+    
+    if (!wifiConnected) {
+      request->send(200, "application/json", "{\"success\":false,\"message\":\"WiFi not connected\"}");
+      return;
+    }
+    
+    // Ensure MQTT is connected
+    if (!mqttClient.connected()) {
+      Serial.println("🔌 MQTT not connected, attempting to connect...");
+      connectMQTT();
+      delay(1000); // Give time to connect
+    }
+    
+    if (!mqttClient.connected()) {
+      String msg = "MQTT connection failed (code: " + String(mqttClient.state()) + ")";
+      request->send(200, "application/json", "{\"success\":false,\"message\":\"" + msg + "\"}");
+      return;
+    }
+    
+    // Publish the message
+    publishMQTT();
+    
+    request->send(200, "application/json", "{\"success\":true,\"message\":\"Test message published to " + mqttTopic + "\"}");
+  });
+  // ============================================================================
+  // WiFi Configuration Page and API Endpoints
+  // ============================================================================
+  
+  // WiFi Configuration page
+  server.on("/wifi-config", HTTP_GET, [](AsyncWebServerRequest *request){
+    Serial.println("📄 Serving /wifi-config page");
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WiFi Configuration - TTGO T-Beam</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      padding: 0;
+      min-height: 100vh;
+    }
+    .navbar {
+      background: rgba(0, 0, 0, 0.3);
+      backdrop-filter: blur(10px);
+      padding: 15px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    }
+    .navbar-brand {
+      color: white;
+      font-size: 20px;
+      font-weight: bold;
+      text-decoration: none;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .navbar-menu {
+      display: flex;
+      gap: 5px;
+      flex-wrap: wrap;
+    }
+    .nav-link {
+      color: white;
+      text-decoration: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      transition: all 0.3s;
+      font-size: 14px;
+    }
+    .nav-link:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    .nav-link.active {
+      background: rgba(255, 255, 255, 0.3);
+      font-weight: bold;
+    }
+    .page-content {
+      padding: 20px;
+    }
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      background: white;
+      border-radius: 15px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+      overflow: hidden;
+    }
+    .header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 30px;
+      text-align: center;
+    }
+    .header h1 {
+      font-size: 28px;
+      margin-bottom: 10px;
+    }
+    .content {
+      padding: 30px;
+    }
+    .status-card {
+      background: #f8f9fa;
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 20px;
+      border-left: 4px solid #667eea;
+    }
+    .status-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid #e0e0e0;
+    }
+    .status-row:last-child {
+      border-bottom: none;
+    }
+    .status-label {
+      font-weight: bold;
+      color: #666;
+    }
+    .status-value {
+      color: #333;
+      font-family: monospace;
+    }
+    .status-connected {
+      color: #28a745;
+      font-weight: bold;
+    }
+    .status-disconnected {
+      color: #dc3545;
+      font-weight: bold;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      font-weight: bold;
+      margin-bottom: 8px;
+      color: #333;
+    }
+    input[type="text"],
+    input[type="password"],
+    select {
+      width: 100%;
+      padding: 12px;
+      border: 2px solid #ddd;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    input:focus, select:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    .password-wrapper {
+      position: relative;
+    }
+    .password-toggle {
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      cursor: pointer;
+      color: #666;
+      user-select: none;
+    }
+    .btn {
+      padding: 12px 30px;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      cursor: pointer;
+      transition: all 0.3s;
+      font-weight: bold;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+    }
+    .btn-secondary {
+      background: #6c757d;
+      color: white;
+    }
+    .btn-secondary:hover {
+      background: #5a6268;
+    }
+    .btn-danger {
+      background: #dc3545;
+      color: white;
+    }
+    .btn-danger:hover {
+      background: #c82333;
+    }
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .button-group {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 20px;
+    }
+    .network-list {
+      max-height: 300px;
+      overflow-y: auto;
+      border: 2px solid #ddd;
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    .network-item {
+      padding: 15px;
+      border-bottom: 1px solid #e0e0e0;
+      cursor: pointer;
+      transition: background 0.2s;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .network-item:hover {
+      background: #f8f9fa;
+    }
+    .network-item:last-child {
+      border-bottom: none;
+    }
+    .network-item.selected {
+      background: #e7f3ff;
+      border-left: 4px solid #667eea;
+    }
+    .network-name {
+      font-weight: bold;
+      color: #333;
+    }
+    .network-info {
+      display: flex;
+      gap: 15px;
+      align-items: center;
+      color: #666;
+      font-size: 14px;
+    }
+    .signal-bars {
+      display: flex;
+      gap: 2px;
+      align-items: flex-end;
+    }
+    .signal-bar {
+      width: 4px;
+      background: #ddd;
+      border-radius: 2px;
+    }
+    .signal-bar.active {
+      background: #28a745;
+    }
+    .alert {
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      display: none;
+    }
+    .alert-success {
+      background: #d4edda;
+      color: #155724;
+      border: 1px solid #c3e6cb;
+    }
+    .alert-error {
+      background: #f8d7da;
+      color: #721c24;
+      border: 1px solid #f5c6cb;
+    }
+    .alert-info {
+      background: #d1ecf1;
+      color: #0c5460;
+      border: 1px solid #bee5eb;
+    }
+    .spinner {
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #667eea;
+      border-radius: 50%;
+      width: 20px;
+      height: 20px;
+      animation: spin 1s linear infinite;
+      display: inline-block;
+      margin-left: 10px;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    .help-text {
+      font-size: 13px;
+      color: #666;
+      margin-top: 5px;
+    }
+  </style>
+</head>
+<body>
+  <nav class="navbar">
+    <a href="/" class="navbar-brand">
+      <span>📡</span>
+      <span>TTGO T-Beam v)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span>
+    </a>
+    <div class="navbar-menu">
+      <a href="/" class="nav-link">📊 Dashboard</a>
+      <a href="/settings" class="nav-link">⚙️ Settings</a>
+      <a href="/config" class="nav-link">🔐 LoRa Config</a>
+      <a href="/payload-info" class="nav-link">📦 Payload</a>
+      <a href="/diagnostics" class="nav-link">🔧 Diagnostics</a>
+      <a href="/debug" class="nav-link">🖥️ Debug</a>
+      <a href="/ota" class="nav-link">🔄 OTA</a>
+      <a href="/mqtt" class="nav-link">📨 MQTT</a>
+      <a href="/wifi-config" class="nav-link active">📡 WiFi</a>
+      <a href="/about" class="nav-link">ℹ️ About</a>
+    </div>
+  </nav>
+
+  <div class="page-content">
+    <div class="container">
+      <div class="header">
+        <h1>📡 WiFi Configuration</h1>
+        <p>Configure WiFi network connection</p>
+      </div>
+
+      <div class="content">
+        <div id="alert-success" class="alert alert-success"></div>
+        <div id="alert-error" class="alert alert-error"></div>
+        <div id="alert-info" class="alert alert-info"></div>
+
+        <div class="status-card">
+          <h3 style="margin-bottom: 15px;">📊 Current Status</h3>
+          <div class="status-row">
+            <span class="status-label">Connection:</span>
+            <span id="status-connection" class="status-value">Loading...</span>
+          </div>
+          <div class="status-row">
+            <span class="status-label">SSID:</span>
+            <span id="status-ssid" class="status-value">-</span>
+          </div>
+          <div class="status-row">
+            <span class="status-label">IP Address:</span>
+            <span id="status-ip" class="status-value">-</span>
+          </div>
+          <div class="status-row">
+            <span class="status-label">Signal Strength:</span>
+            <span id="status-rssi" class="status-value">-</span>
+          </div>
+          <div class="status-row">
+            <span class="status-label">MAC Address:</span>
+            <span id="status-mac" class="status-value">-</span>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 30px;">
+          <h3 style="margin-bottom: 15px;">🔍 Available Networks</h3>
+          <button onclick="scanNetworks()" class="btn btn-secondary" id="scan-btn">
+            Scan for Networks
+          </button>
+          <div id="network-list" class="network-list" style="display: none; margin-top: 15px;"></div>
+        </div>
+
+        <div>
+          <h3 style="margin-bottom: 15px;">🔧 Network Configuration</h3>
+          
+          <div class="form-group">
+            <label for="ssid">Network Name (SSID)</label>
+            <input type="text" id="ssid" placeholder="Enter network name" maxlength="32">
+            <div class="help-text">Select from scanned networks or enter manually</div>
+          </div>
+
+          <div class="form-group">
+            <label for="password">Password</label>
+            <div class="password-wrapper">
+              <input type="password" id="password" placeholder="Enter network password" maxlength="64">
+              <span class="password-toggle" onclick="togglePassword()">👁️</span>
+            </div>
+            <div class="help-text">Leave empty for open networks</div>
+          </div>
+
+          <div class="button-group">
+            <button onclick="connectWiFi()" class="btn btn-primary" id="connect-btn">
+              Connect to Network
+            </button>
+            <button onclick="disconnectWiFi()" class="btn btn-secondary">
+              Disconnect
+            </button>
+            <button onclick="resetWiFi()" class="btn btn-danger">
+              Reset WiFi Settings
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.onload = function() { loadWiFiStatus(); };
+
+    function showAlert(type, message) {
+      const alertId = 'alert-' + type;
+      const alert = document.getElementById(alertId);
+      alert.textContent = message;
+      alert.style.display = 'block';
+      setTimeout(() => { alert.style.display = 'none'; }, 5000);
+    }
+
+    function loadWiFiStatus() {
+      fetch('/api/wifi-status')
+        .then(response => response.json())
+        .then(data => {
+          const connStatus = document.getElementById('status-connection');
+          if (data.connected) {
+            connStatus.textContent = 'Connected';
+            connStatus.className = 'status-value status-connected';
+          } else {
+            connStatus.textContent = 'Disconnected';
+            connStatus.className = 'status-value status-disconnected';
+          }
+          document.getElementById('status-ssid').textContent = data.ssid || '-';
+          document.getElementById('status-ip').textContent = data.ip || '-';
+          document.getElementById('status-rssi').textContent = data.rssi ? data.rssi + ' dBm' : '-';
+          document.getElementById('status-mac').textContent = data.mac || '-';
+        })
+        .catch(error => {
+          console.error('Error loading WiFi status:', error);
+          showAlert('error', 'Failed to load WiFi status');
+        });
+    }
+
+    function scanNetworks() {
+      const btn = document.getElementById('scan-btn');
+      const list = document.getElementById('network-list');
+      btn.disabled = true;
+      btn.innerHTML = 'Scanning<span class="spinner"></span>';
+      list.innerHTML = '<div style="padding: 20px; text-align: center;">Scanning for networks...</div>';
+      list.style.display = 'block';
+
+      fetch('/api/wifi-scan')
+        .then(response => response.json())
+        .then(data => {
+          if (data.networks && data.networks.length > 0) {
+            list.innerHTML = '';
+            data.networks.forEach(network => {
+              const item = document.createElement('div');
+              item.className = 'network-item';
+              item.onclick = () => selectNetwork(network.ssid, item);
+              const signalBars = getSignalBars(network.rssi);
+              const securityIcon = network.encryption === 0 ? '🔓' : '🔒';
+              item.innerHTML = `
+                <div class="network-name">${securityIcon} ${network.ssid}</div>
+                <div class="network-info">
+                  <div>${signalBars}</div>
+                  <div>${network.rssi} dBm</div>
+                  <div>Ch ${network.channel}</div>
+                </div>
+              `;
+              list.appendChild(item);
+            });
+            showAlert('success', `Found ${data.networks.length} networks`);
+          } else {
+            list.innerHTML = '<div style="padding: 20px; text-align: center; color: #666;">No networks found</div>';
+            showAlert('info', 'No networks found. Try scanning again.');
+          }
+        })
+        .catch(error => {
+          console.error('Error scanning networks:', error);
+          list.innerHTML = '<div style="padding: 20px; text-align: center; color: #dc3545;">Scan failed</div>';
+          showAlert('error', 'Failed to scan networks');
+        })
+        .finally(() => {
+          btn.disabled = false;
+          btn.textContent = 'Scan for Networks';
+        });
+    }
+
+    function getSignalBars(rssi) {
+      const bars = [];
+      const strength = rssi > -50 ? 4 : rssi > -60 ? 3 : rssi > -70 ? 2 : 1;
+      for (let i = 1; i <= 4; i++) {
+        const height = i * 5;
+        const active = i <= strength ? 'active' : '';
+        bars.push(`<div class="signal-bar ${active}" style="height: ${height}px;"></div>`);
+      }
+      return '<div class="signal-bars">' + bars.join('') + '</div>';
+    }
+
+    function selectNetwork(ssid, element) {
+      document.querySelectorAll('.network-item').forEach(item => {
+        item.classList.remove('selected');
+      });
+      element.classList.add('selected');
+      document.getElementById('ssid').value = ssid;
+      showAlert('info', `Selected network: ${ssid}`);
+    }
+
+    function togglePassword() {
+      const input = document.getElementById('password');
+      input.type = input.type === 'password' ? 'text' : 'password';
+    }
+
+    function connectWiFi() {
+      const ssid = document.getElementById('ssid').value.trim();
+      const password = document.getElementById('password').value;
+      if (!ssid) {
+        showAlert('error', 'Please enter a network name (SSID)');
+        return;
+      }
+      const btn = document.getElementById('connect-btn');
+      btn.disabled = true;
+      btn.innerHTML = 'Connecting<span class="spinner"></span>';
+      fetch('/api/wifi-connect', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ssid: ssid, password: password})
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          showAlert('success', data.message || 'Connected successfully!');
+          setTimeout(() => { loadWiFiStatus(); }, 2000);
+        } else {
+          showAlert('error', data.message || 'Connection failed');
+        }
+      })
+      .catch(error => {
+        console.error('Error connecting:', error);
+        showAlert('error', 'Failed to connect to network');
+      })
+      .finally(() => {
+        btn.disabled = false;
+        btn.textContent = 'Connect to Network';
+      });
+    }
+
+    function disconnectWiFi() {
+      if (!confirm('Disconnect from current network?')) return;
+      fetch('/api/wifi-disconnect', {method: 'POST'})
+        .then(response => response.json())
+        .then(data => {
+          showAlert('success', 'Disconnected from WiFi');
+          setTimeout(() => { loadWiFiStatus(); }, 1000);
+        })
+        .catch(error => {
+          console.error('Error disconnecting:', error);
+          showAlert('error', 'Failed to disconnect');
+        });
+    }
+
+    function resetWiFi() {
+      if (!confirm('Reset WiFi settings? This will clear saved credentials and restart the device in AP mode.')) return;
+      fetch('/api/wifi-reset', {method: 'POST'})
+        .then(response => response.json())
+        .then(data => {
+          showAlert('info', 'WiFi settings reset. Device will restart...');
+          setTimeout(() => { window.location.href = '/'; }, 3000);
+        })
+        .catch(error => {
+          console.error('Error resetting WiFi:', error);
+          showAlert('error', 'Failed to reset WiFi settings');
+        });
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+    request->send(200, "text/html", html);
+  });
+
+  // WiFi Status API
+  server.on("/api/wifi-status", HTTP_GET, [](AsyncWebServerRequest *request){
+    wifi_mode_t mode = WiFi.getMode();
+    String json = "{";
+    json += "\"mode\":\"";
+    if (mode == WIFI_MODE_AP) {
+      json += "AP\",";
+      json += "\"connected\":false,";
+      json += "\"ssid\":\"" + WiFi.softAPSSID() + "\",";
+      json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+      json += "\"clients\":" + String(WiFi.softAPgetStationNum()) + ",";
+    } else if (mode == WIFI_MODE_STA) {
+      json += "STA\",";
+      json += "\"connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+      json += "\"ssid\":\"" + WiFi.SSID() + "\",";
+      json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+      json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+    } else if (mode == WIFI_MODE_APSTA) {
+      json += "APSTA\",";
+      json += "\"connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+      json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
+      json += "\"sta_ip\":\"" + WiFi.localIP().toString() + "\",";
+    } else {
+      json += "OFF\",";
+      json += "\"connected\":false,";
+    }
+    json += "\"mac\":\"" + WiFi.macAddress() + "\",";
+    json += "\"status\":" + String(WiFi.status());
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  // WiFi Scan API
+  server.on("/api/wifi-scan", HTTP_GET, [](AsyncWebServerRequest *request){
+    Serial.println("📡 WiFi scan requested");
+    
+    // Ensure WiFi is in STA or STA+AP mode for scanning
+    wifi_mode_t currentMode = WiFi.getMode();
+    if (currentMode == WIFI_MODE_NULL || currentMode == WIFI_MODE_AP) {
+      Serial.println("📡 Switching to STA mode for scan");
+      WiFi.mode(WIFI_MODE_APSTA); // Allow both AP and STA for scanning
+      delay(100);
+    }
+    
+    // Perform scan with yield to prevent watchdog timeout
+    yield();
+    int n = WiFi.scanNetworks(false, true); // async=false, show_hidden=true
+    yield();
+    
+    if (n < 0) {
+      Serial.println("✗ WiFi scan failed");
+      request->send(500, "application/json", "{\"networks\":[],\"error\":\"Scan failed\"}");
+      return;
+    }
+    
+    Serial.printf("📡 Found %d networks\n", n);
+    
+    String json = "{\"networks\":[";
+    for (int i = 0; i < n; i++) {
+      if (i > 0) json += ",";
+      json += "{";
+      json += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
+      json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+      json += "\"encryption\":" + String(WiFi.encryptionType(i)) + ",";
+      json += "\"channel\":" + String(WiFi.channel(i));
+      json += "}";
+      yield(); // Feed watchdog while building JSON
+    }
+    json += "]}";
+    
+    WiFi.scanDelete();
+    request->send(200, "application/json", json);
+  });
+
+  // WiFi Connect API - saves credentials to NVS then connects
+  server.on("/api/wifi-connect", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      String body = "";
+      for (size_t i = 0; i < len; i++) {
+        body += (char)data[i];
+      }
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, body);
+      if (error) {
+        request->send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
+        return;
+      }
+      String ssid = doc["ssid"].as<String>();
+      String password = doc["password"].as<String>();
+
+      if (ssid.length() == 0) {
+        request->send(400, "application/json", "{\"success\":false,\"message\":\"SSID cannot be empty\"}");
+        return;
+      }
+
+      Serial.print("📡 Web UI connecting to: ");
+      Serial.println(ssid);
+
+      // Save credentials to NVS - same namespace/keys as wifi-set serial command
+      preferences.begin("wifi", false);
+      preferences.putString("ssid", ssid);
+      preferences.putString("password", password);
+      preferences.end();
+      Serial.println("💾 Credentials saved to NVS");
+
+      // Properly tear down AP mode if running (same logic as wifi-set)
+      wifi_mode_t currentMode = WiFi.getMode();
+      if (currentMode == WIFI_MODE_AP || currentMode == WIFI_MODE_APSTA) {
+        Serial.println("📡 Stopping AP mode...");
+        WiFi.softAPdisconnect(true);
+        delay(300);
+      }
+      WiFi.mode(WIFI_OFF);
+      delay(500);
+      WiFi.persistent(false);  // Use our NVS, not the library-managed flash
+      WiFi.mode(WIFI_STA);
+      WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE); // Re-enable DHCP
+      delay(300);
+
+      wifiConfigMode = false;
+
+      // Start connection (non-blocking - response is sent immediately)
+      WiFi.begin(ssid.c_str(), password.c_str());
+      Serial.println("📡 Connection started in background");
+
+      String response = "{\"success\":true,\"message\":\"Connecting to " + ssid + "...\",\"status\":\"connecting\"}";
+      request->send(200, "application/json", response);
+    }
+  );
+
+  // WiFi Disconnect API
+  server.on("/api/wifi-disconnect", HTTP_POST, [](AsyncWebServerRequest *request){
+    Serial.println("📡 Disconnecting WiFi");
+    WiFi.disconnect(true);
+    wifiConnected = false;
+    request->send(200, "application/json", "{\"success\":true,\"message\":\"Disconnected\"}");
+  });
+
+
+  // OTA Update from file upload endpoint
+  server.on("/api/ota-upload", HTTP_POST,
+    // Request complete handler - send response then restart
+    [](AsyncWebServerRequest *request) {
+      bool success = !Update.hasError();
+      if (success) {
+        Serial.println("✓ OTA upload complete - restarting");
+        AsyncWebServerResponse *response = request->beginResponse(200, "application/json",
+          "{\"success\":true,\"message\":\"Update successful, restarting...\"}");
+        response->addHeader("Connection", "close");
+        request->send(response);
+        delay(500);
+        ESP.restart();
+      } else {
+        int errorCode = Update.getError();
+        Serial.printf("✗ OTA upload failed - error %d: %s\n", errorCode, Update.errorString());
+        String jsonResponse = "{\"success\":false,\"message\":\"Update failed: ";
+        jsonResponse += Update.errorString();
+        jsonResponse += "\",\"error_code\":";
+        jsonResponse += String(errorCode);
+        jsonResponse += "}";
+        request->send(200, "application/json", jsonResponse);
+        otaInProgress = false;
+      }
+    },
+    // Chunk handler - called for each data chunk as it arrives
+    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+      if (!index) {
+        // First chunk: initialise the update
+        otaInProgress = true;
+        Serial.printf("\n🔄 OTA upload started: %s  free-sketch: %u bytes\n",
+                      filename.c_str(), ESP.getFreeSketchSpace());
+
+        // Show OTA start on OLED
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0);
+        display.println("  Firmware Update");
+        display.println("  ─────────────────");
+        display.println();
+        display.println("  Uploading...");
+        display.println();
+        display.println("  Do NOT power off!");
+        display.display();
+
+        // ── Stop every task/interrupt that might access flash during write ──
+        // MQTT
+        if (mqttClient.connected()) mqttClient.disconnect();
+
+        // GPS serial
+        if (gpsEnabled) { GpsSerial.end(); }
+
+        // LMIC DIO GPIO interrupts — must be disabled BEFORE BLE deinit.
+        // MCCI LMIC 4.x registers these via esp_intr_alloc(), not through the
+        // Arduino GPIO ISR service, so detachInterrupt() silently fails.
+        // gpio_intr_disable() kills interrupt generation at the GPIO hardware
+        // register level regardless of how the ISR was registered, which is
+        // exactly what we need before Update.write() disables the I-cache.
+        gpio_intr_disable((gpio_num_t)LORA_DIO0_PIN);
+        gpio_intr_disable((gpio_num_t)LORA_DIO1_PIN);
+        gpio_intr_disable((gpio_num_t)LORA_DIO2_PIN);
+        Serial.println("✓ LoRa DIO GPIO interrupts disabled");
+
+        // NimBLE: fully deinit AFTER disabling GPIO interrupts.
+        // BLE teardown can uninstall the GPIO ISR service, so GPIO must be
+        // dealt with first.
+        if (pBLEScan != nullptr) {
+          pBLEScan->stop();
+          pBLEScan = nullptr;
+        }
+        if (paxCounterEnabled && paxBleScanEnabled) {
+          Serial.println("🛑 Deinitialising BLE before OTA flash write...");
+          NimBLEDevice::deinit(true);
+          Serial.println("✓ BLE deinitialised");
+        }
+
+        // Let FreeRTOS settle before we disable the instruction cache
+        delay(300);
+
+        // Use UPDATE_SIZE_UNKNOWN so the library handles sizing automatically
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Serial.printf("✗ Update.begin failed: %s\n", Update.errorString());
+          display.clearDisplay();
+          display.setCursor(0, 0);
+          display.println("  Firmware Update");
+          display.println("  ─────────────────");
+          display.println();
+          display.println("  ERROR:");
+          display.println("  begin() failed");
+          display.display();
+        } else {
+          Serial.println("✓ Update.begin OK");
+        }
+      }
+
+      // Write this chunk
+      if (!Update.hasError()) {
+        if (Update.write(data, len) != len) {
+          Serial.printf("✗ Update.write failed at index %u: %s\n", index, Update.errorString());
+        } else if (index % (64 * 1024) == 0 && index > 0) {
+          Serial.printf("⏳ OTA progress: %u bytes\n", index + len);
+          // Update OLED progress every 64 KB
+          uint32_t kbDone = (index + len) / 1024;
+          display.clearDisplay();
+          display.setTextSize(1);
+          display.setTextColor(SSD1306_WHITE);
+          display.setCursor(0, 0);
+          display.println("  Firmware Update");
+          display.println("  ─────────────────");
+          display.println();
+          display.print("  ");
+          display.print(kbDone);
+          display.println(" KB written");
+          display.println();
+          display.println("  Do NOT power off!");
+          display.display();
+        }
+      }
+
+      // Final chunk
+      if (final) {
+        if (!Update.hasError()) {
+          if (Update.end(true)) {
+            Serial.printf("✓ OTA finished: %u bytes written\n", index + len);
+            display.clearDisplay();
+            display.setTextSize(1);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(0, 0);
+            display.println("  Firmware Update");
+            display.println("  ─────────────────");
+            display.println();
+            display.println("  Upload complete!");
+            display.println();
+            display.println("  Restarting...");
+            display.display();
+          } else {
+            Serial.printf("✗ Update.end failed: %s\n", Update.errorString());
+            display.clearDisplay();
+            display.setCursor(0, 0);
+            display.println("  Firmware Update");
+            display.println("  ─────────────────");
+            display.println();
+            display.println("  ERROR:");
+            display.println("  end() failed");
+            display.display();
+          }
+        }
+      }
+    }
+  );
+
+  // 404 handler - redirect to dashboard
+  server.onNotFound([](AsyncWebServerRequest *request){
+    // Redirect all unknown paths to dashboard
+    request->redirect("/");
   });
   
   server.begin();
@@ -6184,45 +8891,215 @@ function decodeUplink(input) {
  * @see setupWebServer() for web server initialization
  * @see WIFI_AP_NAME and WIFI_AP_PASSWORD constants
  */
+void showWiFiStatusOnDisplay(const char* line1, const char* line2 = nullptr, const char* line3 = nullptr) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("WiFi Setup");
+  display.println("----------");
+  display.println(line1);
+  if (line2) display.println(line2);
+  if (line3) display.println(line3);
+  display.display();
+}
+
+void configureWiFiRadio() {
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+
+  // ESP32 coexistence rule: WiFi modem sleep MUST be enabled when BLE is
+  // also active. Using WIFI_PS_NONE with BLE causes an abort().
+  bool bleActive = paxCounterEnabled && paxBleScanEnabled;
+  if (bleActive) {
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    WiFi.setSleep(true);
+  } else {
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    WiFi.setSleep(false);
+  }
+
+  wifi_country_t country = {"EU", 1, 13, WIFI_COUNTRY_POLICY_MANUAL};
+  esp_wifi_set_country(&country);
+}
+
+void logWiFiScanForTarget(const String& targetSsid) {
+  int networkCount = WiFi.scanNetworks(false, true, false, 300);
+  if (networkCount < 0) {
+    Serial.println("⚠️  WiFi scan failed before connect attempt");
+    return;
+  }
+
+  Serial.print("📶 WiFi scan: ");
+  Serial.print(networkCount);
+  Serial.println(" network(s) visible:");
+
+  bool found = false;
+  for (int i = 0; i < networkCount; i++) {
+    bool isTarget = (WiFi.SSID(i) == targetSsid);
+    if (isTarget) found = true;
+
+    Serial.print(isTarget ? "  ► " : "    ");
+    Serial.print(WiFi.SSID(i).isEmpty() ? "(hidden)" : WiFi.SSID(i));
+    Serial.print("  ch=");
+    Serial.print(WiFi.channel(i));
+    Serial.print("  rssi=");
+    Serial.print(WiFi.RSSI(i));
+    Serial.print("  enc=");
+    Serial.println(static_cast<int>(WiFi.encryptionType(i)));
+  }
+
+  if (!found) {
+    Serial.print("⚠️  Target SSID \"");
+    Serial.print(targetSsid);
+    Serial.println("\" is not visible to the ESP32");
+    Serial.println("   Check that the network is 2.4 GHz, not WPA3-only, and on channels 1-13");
+  }
+
+  WiFi.scanDelete();
+}
+
 void setupWiFi() {
-  Serial.println("=== WiFi Setup ===");
+  Serial.println("\n╔════════════════════════════════════════════════════════════╗");
+  Serial.println("║                    WiFi Setup                              ║");
+  Serial.println("╚════════════════════════════════════════════════════════════╝");
+  
+  // Set WiFi hostname to T-Beam-XXXXXX (using last 6 chars of MAC)
+  String macAddress = WiFi.macAddress();
+  macAddress.replace(":", "");
+  String hostname = "T-Beam-" + macAddress.substring(6); // Last 6 chars
+  WiFi.setHostname(hostname.c_str());
+  Serial.print("📛 WiFi Hostname: ");
+  Serial.println(hostname);
+  
+  // Show WiFi setup on display
+  showWiFiStatusOnDisplay("Initializing...");
   
   // Check if boot button is pressed for WiFi reset
   pinMode(WIFI_RESET_BUTTON_PIN, INPUT);
   if (digitalRead(WIFI_RESET_BUTTON_PIN) == LOW) {
-    Serial.println("Boot button pressed - resetting WiFi settings");
-    wifiManager.resetSettings();
+    Serial.println("🔘 Boot button pressed - clearing WiFi credentials");
+    showWiFiStatusOnDisplay("Clearing WiFi", "credentials...");
+    preferences.begin("wifi", false);
+    preferences.clear();
+    preferences.end();
     delay(1000);
   }
   
-  // Set WiFi mode
-  WiFi.mode(WIFI_STA);
+  // Load saved WiFi credentials from preferences
+  preferences.begin("wifi", true);
+  String savedSSID = preferences.getString("ssid", "");
+  String savedPassword = preferences.getString("password", "");
+  preferences.end();
+
+  configureWiFiRadio();
+
+  bool connectedToSavedNetwork = false;
   
-  // Configure WiFiManager
-  wifiManager.setConfigPortalTimeout(WIFI_CONFIG_TIMEOUT_MS / 1000);
-  wifiManager.setAPCallback([](WiFiManager *myWiFiManager) {
-    Serial.println("Entered config mode");
-    Serial.print("AP Name: ");
-    Serial.println(myWiFiManager->getConfigPortalSSID());
-    wifiConfigMode = true;
-  });
-  
-  wifiManager.setSaveConfigCallback([]() {
-    Serial.println("WiFi credentials saved");
-    wifiConfigMode = false;
-  });
-  
-  // Try to connect or start config portal
-  if (!wifiManager.autoConnect(WIFI_AP_NAME, WIFI_AP_PASSWORD)) {
-    Serial.println("Failed to connect and timeout reached");
-    wifiConnected = false;
-  } else {
-    Serial.println("WiFi connected!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    wifiConnected = true;
-    setupWebServer();
+  // Try to connect to saved WiFi if credentials exist
+  if (savedSSID.length() > 0) {
+    Serial.println("📡 Attempting to connect to saved network...");
+    Serial.print("   SSID: ");
+    Serial.println(savedSSID);
+    
+    showWiFiStatusOnDisplay("Connecting to", savedSSID.c_str(), "Please wait...");
+    
+    logWiFiScanForTarget(savedSSID);
+    WiFi.mode(WIFI_STA);
+    wifiConnecting = true;
+    wifiConnectStartedAt = millis();
+    WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
+    
+    // Wait up to 30 seconds for connection
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 60) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    Serial.println();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      connectedToSavedNetwork = true;
+      wifiConnecting = false;
+      Serial.println("\n╔════════════════════════════════════════════════════════════╗");
+      Serial.println("║              ✓ WiFi Connected Successfully!               ║");
+      Serial.println("╚════════════════════════════════════════════════════════════╝");
+      Serial.print("🌐 IP Address: ");
+      Serial.println(WiFi.localIP());
+      Serial.print("📶 SSID: ");
+      Serial.println(WiFi.SSID());
+      Serial.print("📡 RSSI: ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
+      Serial.println("\n🌐 Web Dashboard: http://" + WiFi.localIP().toString());
+      Serial.println("════════════════════════════════════════════════════════════\n");
+      
+      // Show success on display
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.println("WiFi Connected!");
+      display.println("------------");
+      display.print("SSID: ");
+      display.println(WiFi.SSID());
+      display.print("IP: ");
+      display.println(WiFi.localIP());
+      display.print("RSSI: ");
+      display.print(WiFi.RSSI());
+      display.println(" dBm");
+      display.display();
+      delay(3000);
+      
+      wifiConnected = true;
+    } else {
+      wifiConnecting = false;
+      Serial.println("\n⚠️  Failed to connect to saved network");
+    }
   }
+  
+  // If not connected, start AP mode
+  if (!connectedToSavedNetwork) {
+    Serial.println("\n🔄 Starting AP mode...");
+    wifiConnected = false;
+    wifiConfigMode = true;
+    
+    showWiFiStatusOnDisplay("Starting AP", "mode...");
+    delay(1000);
+    
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(WIFI_AP_NAME, WIFI_AP_PASSWORD);
+    
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("📡 AP Mode - SSID: ");
+    Serial.println(WIFI_AP_NAME);
+    Serial.print("🔑 Password: ");
+    Serial.println(WIFI_AP_PASSWORD);
+    Serial.print("🌐 AP IP address: ");
+    Serial.println(IP);
+    Serial.println("\n🌐 Web Dashboard: http://" + IP.toString());
+    Serial.println("   Configure WiFi via the WiFi page");
+    Serial.println("════════════════════════════════════════════════════════════\n");
+    
+    // Show AP info on display
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("WiFi AP Mode");
+    display.println("------------");
+    display.print("SSID: ");
+    display.println(WIFI_AP_NAME);
+    display.print("Pass: ");
+    display.println(WIFI_AP_PASSWORD);
+    display.print("IP: ");
+    display.println(IP);
+    display.display();
+  }
+  
+  // Always start web server with application pages
+  setupWebServer();
 }
 
 /**
@@ -6254,6 +9131,8 @@ void printSerialMenu() {
   Serial.println("╚════════════════════════════════════════════════════════════╝");
   Serial.println("\n📡 WiFi Commands:");
   Serial.println("  wifi-status    - Show WiFi connection status");
+  Serial.println("  wifi-info      - Show saved WiFi credentials and config");
+  Serial.println("  wifi-set <ssid> <password> - Set WiFi credentials and connect");
   Serial.println("  wifi-on        - Enable WiFi and web server");
   Serial.println("  wifi-off       - Disable WiFi (saves power)");
   Serial.println("  wifi-reset     - Reset WiFi credentials and restart");
@@ -6290,6 +9169,19 @@ void printSerialMenu() {
   Serial.println("  channel-enable <1-10>  - Enable payload channel");
   Serial.println("  channel-disable <1-10> - Disable payload channel");
   Serial.println("  channel-status - Show all channel states");
+  Serial.println("\n📨 MQTT Commands:");
+  Serial.println("  mqtt-status    - Show MQTT configuration and status");
+  Serial.println("  mqtt-on        - Enable MQTT publishing");
+  Serial.println("  mqtt-off       - Disable MQTT publishing");
+  Serial.println("  mqtt-server <server> - Set MQTT broker server");
+  Serial.println("  mqtt-port <port> - Set MQTT broker port");
+  Serial.println("  mqtt-user <username> - Set MQTT username");
+  Serial.println("  mqtt-pass <password> - Set MQTT password");
+  Serial.println("  mqtt-topic <topic> - Set MQTT topic");
+  Serial.println("  mqtt-device <name> - Set device name");
+  Serial.println("  mqtt-interval <sec> - Set publish interval (5-3600 sec)");
+  Serial.println("  mqtt-test      - Test MQTT connection");
+  Serial.println("  mqtt-save      - Save MQTT settings to NVS");
   Serial.println("\n🔧 System Commands:");
   Serial.println("  status         - Show complete system status");
   Serial.println("  debug-on       - Enable verbose debugging");
@@ -6386,6 +9278,28 @@ void printSystemStatus() {
     Serial.println(" hPa");
   }
   
+  // MQTT Status
+  Serial.println("\n📨 MQTT:");
+  Serial.print("  Enabled: ");
+  Serial.println(mqttEnabled ? "✓ Yes" : "✗ No");
+  if (mqttEnabled) {
+    Serial.print("  Connected: ");
+    Serial.println(mqttConnected ? "✓ Yes" : "✗ No");
+    Serial.print("  Server: ");
+    Serial.println(mqttServer.length() > 0 ? mqttServer : "(not set)");
+    Serial.print("  Port: ");
+    Serial.println(mqttPort);
+    Serial.print("  Topic: ");
+    Serial.println(mqttTopic);
+    Serial.print("  Device Name: ");
+    Serial.println(mqttDeviceName);
+    Serial.print("  Publish Interval: ");
+    Serial.print(mqttPublishInterval / 1000);
+    Serial.println(" sec");
+    Serial.print("  Published: ");
+    Serial.println(mqttPublishCounter);
+  }
+  
   // System
   Serial.println("\n💾 System:");
   Serial.print("  Firmware: v");
@@ -6415,8 +9329,9 @@ void printSystemStatus() {
 
 void handleSerialCommands() {
   if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
+    String rawCmd = Serial.readStringUntil('\n');
+    rawCmd.trim();
+    String cmd = rawCmd;
     cmd.toLowerCase();
     
     if (cmd == "menu") {
@@ -6445,28 +9360,225 @@ void handleSerialCommands() {
         Serial.println("ℹ WiFi already disabled");
       }
       
+    } else if (cmd.startsWith("wifi-set ")) {
+      // Parse: wifi-set <ssid> <password>
+      // Use rawCmd to preserve case of SSID and password
+      String params = rawCmd.substring(9); // Remove "wifi-set "
+      int spaceIndex = params.indexOf(' ');
+      
+      if (spaceIndex == -1) {
+        Serial.println("❌ Usage: wifi-set <ssid> <password>");
+        Serial.println("   Example: wifi-set MyNetwork MyPassword123");
+        Serial.println("   Note: For open networks, use: wifi-set <ssid> \"\"");
+      } else {
+        String ssid = params.substring(0, spaceIndex);
+        String password = params.substring(spaceIndex + 1);
+        
+        // Remove quotes if present
+        ssid.trim();
+        password.trim();
+        if (password.startsWith("\"") && password.endsWith("\"")) {
+          password = password.substring(1, password.length() - 1);
+        }
+        
+        Serial.println("\n╔════════════════════════════════════════════════════════════╗");
+        Serial.println("║              📡 Setting WiFi Credentials                  ║");
+        Serial.println("╚════════════════════════════════════════════════════════════╝");
+        Serial.print("📝 SSID: ");
+        Serial.println(ssid);
+        Serial.print("🔐 Password: ");
+        Serial.println(password.length() > 0 ? "****** (set)" : "(empty - open network)");
+        
+        // Properly tear down AP mode if it was running, then switch to STA
+        wifi_mode_t currentMode = WiFi.getMode();
+        if (currentMode == WIFI_MODE_AP || currentMode == WIFI_MODE_APSTA) {
+          Serial.println("📡 Stopping AP mode...");
+          WiFi.softAPdisconnect(true);
+          delay(300);
+        }
+        configureWiFiRadio();
+        WiFi.mode(WIFI_OFF);
+        delay(500);                   // Allow radio to fully shut down
+        WiFi.mode(WIFI_STA);
+        WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE); // Re-enable DHCP
+        delay(500);                   // Allow STA radio to initialise
+        
+        wifiConfigMode = false;
+        logWiFiScanForTarget(ssid);
+        
+        // Try to connect
+        Serial.println("📡 Attempting to connect...");
+        Serial.print("   Debug - status before begin: ");
+        Serial.println(WiFi.status());
+        wifiConnecting = true;
+        wifiConnectStartedAt = millis();
+        WiFi.begin(ssid.c_str(), password.c_str());
+        
+        // Wait up to 20 seconds for connection
+        int attempts = 0;
+        int lastStatus = -1;
+        while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+          delay(500);
+          int s = WiFi.status();
+          if (s != lastStatus) {
+            Serial.print("[status:");
+            Serial.print(s);
+            Serial.print("]");
+            lastStatus = s;
+          } else {
+            Serial.print(".");
+          }
+          attempts++;
+        }
+        Serial.println();
+        
+        // Save credentials to NVS regardless of connection result
+        Preferences prefs;
+        prefs.begin("wifi", false);
+        prefs.putString("ssid", ssid);
+        prefs.putString("password", password);
+        prefs.end();
+        
+        if (WiFi.status() == WL_CONNECTED) {
+          wifiConnected = true;
+          wifiConnecting = false;
+          wifiConfigMode = false;
+          Serial.println("\n✓ WiFi Connected Successfully!");
+          Serial.print("   IP Address: ");
+          Serial.println(WiFi.localIP().toString());
+          Serial.print("   SSID: ");
+          Serial.println(WiFi.SSID());
+          Serial.print("   RSSI: ");
+          Serial.print(WiFi.RSSI());
+          Serial.println(" dBm");
+          Serial.println("\n💾 Credentials saved to NVS");
+          Serial.println("   Device will use these credentials on next boot");
+        } else {
+          wifiConnected = false;
+          wifiConnecting = false;
+          Serial.println("\n✗ WiFi Connection Failed!");
+          Serial.print("   Status code: ");
+          Serial.println(WiFi.status());
+          Serial.println("   Possible reasons:");
+          Serial.println("   - Wrong password");
+          Serial.println("   - Network out of range");
+          Serial.println("   - Router not responding");
+          Serial.println("   - WPA3-only network (ESP32 needs WPA2)");
+          Serial.println("\n💾 Credentials saved to NVS anyway");
+          Serial.println("   Device will retry these credentials on next boot");
+          Serial.println("\n💡 Tip: Use 'wifi-info' to check saved credentials");
+        }
+      }
+      
     } else if (cmd == "wifi-reset") {
-      Serial.println("⚠ Resetting WiFi settings...");
-      wifiManager.resetSettings();
-      delay(1000);
+      Serial.println("\n╔════════════════════════════════════════════════════════════╗");
+      Serial.println("║              ⚠️  Resetting WiFi Settings                  ║");
+      Serial.println("╚════════════════════════════════════════════════════════════╝");
+      Serial.println("📝 Clearing saved WiFi credentials...");
+      preferences.begin("wifi", false);
+      preferences.clear();
+      preferences.end();
+      Serial.println("✓ WiFi settings cleared");
+      Serial.println("🔄 Restarting device in 2 seconds...");
+      Serial.println("   After restart, device will enter AP mode");
+      Serial.println("   Connect to: TTGO-T-Beam-Setup");
+      Serial.println("   Password: 12345678");
+      delay(2000);
       ESP.restart();
+      
+    } else if (cmd == "wifi-info") {
+      Serial.println("\n╔════════════════════════════════════════════════════════════╗");
+      Serial.println("║                WiFi Configuration Info                     ║");
+      Serial.println("╚════════════════════════════════════════════════════════════╝");
+      
+      // Read saved WiFi credentials from preferences
+      preferences.begin("wifi", true);
+      String savedSSID = preferences.getString("ssid", "");
+      String savedPassword = preferences.getString("password", "");
+      preferences.end();
+      
+      Serial.print("📡 Saved SSID: ");
+      if (savedSSID.length() > 0) {
+        Serial.println(savedSSID);
+        Serial.print("   SSID Length: ");
+        Serial.println(savedSSID.length());
+        Serial.print("🔐 Password: ");
+        if (savedPassword.length() > 0) {
+          Serial.println("****** (set)");
+          Serial.print("   Password Length: ");
+          Serial.println(savedPassword.length());
+        } else {
+          Serial.println("(not set)");
+        }
+      } else {
+        Serial.println("(none - will enter AP mode)");
+      }
+      
+      Serial.print("📶 Current Status: ");
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("Connected");
+        Serial.print("   IP: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("   RSSI: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
+        Serial.print("   MAC: ");
+        Serial.println(WiFi.macAddress());
+      } else {
+        Serial.print("Not connected (Status: ");
+        Serial.print(WiFi.status());
+        Serial.println(")");
+        Serial.println("   Status codes:");
+        Serial.println("   0 = WL_IDLE_STATUS");
+        Serial.println("   1 = WL_NO_SSID_AVAIL");
+        Serial.println("   3 = WL_CONNECTED");
+        Serial.println("   4 = WL_CONNECT_FAILED");
+        Serial.println("   6 = WL_DISCONNECTED");
+      }
+      
+      Serial.print("📡 WiFi Mode: ");
+      Serial.println(WiFi.getMode());
+      Serial.print("🔋 TX Power: ");
+      Serial.println(WiFi.getTxPower());
       
     } else if (cmd == "wifi-status") {
       Serial.println("\n📡 WiFi Status:");
-      Serial.print("  Enabled: ");
-      Serial.println(wifiEnabled ? "Yes" : "No");
-      Serial.print("  Connected: ");
-      Serial.println(wifiConnected ? "Yes" : "No");
-      if (wifiConnected) {
-        Serial.print("  SSID: ");
-        Serial.println(WiFi.SSID());
-        Serial.print("  IP: ");
-        Serial.println(WiFi.localIP());
-        Serial.print("  Signal: ");
-        Serial.print(WiFi.RSSI());
-        Serial.println(" dBm");
+      Serial.print("  Mode: ");
+      
+      wifi_mode_t mode = WiFi.getMode();
+      if (mode == WIFI_MODE_AP) {
+        Serial.println("AP (Access Point)");
+        Serial.print("  AP SSID: ");
+        Serial.println(WiFi.softAPSSID());
+        Serial.print("  AP IP: ");
+        Serial.println(WiFi.softAPIP());
+        Serial.print("  Clients: ");
+        Serial.println(WiFi.softAPgetStationNum());
         Serial.print("  Dashboard: http://");
+        Serial.println(WiFi.softAPIP());
+      } else if (mode == WIFI_MODE_STA) {
+        Serial.println("STA (Station)");
+        Serial.print("  Connected: ");
+        Serial.println(WiFi.status() == WL_CONNECTED ? "Yes" : "No");
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.print("  SSID: ");
+          Serial.println(WiFi.SSID());
+          Serial.print("  IP: ");
+          Serial.println(WiFi.localIP());
+          Serial.print("  Signal: ");
+          Serial.print(WiFi.RSSI());
+          Serial.println(" dBm");
+          Serial.print("  Dashboard: http://");
+          Serial.println(WiFi.localIP());
+        }
+      } else if (mode == WIFI_MODE_APSTA) {
+        Serial.println("AP+STA (Both)");
+        Serial.print("  AP IP: ");
+        Serial.println(WiFi.softAPIP());
+        Serial.print("  STA IP: ");
         Serial.println(WiFi.localIP());
+      } else {
+        Serial.println("OFF");
       }
       Serial.println();
       
@@ -6735,6 +9847,185 @@ void handleSerialCommands() {
         Serial.println();
       }
       
+    } else if (cmd.startsWith("mqtt-")) {
+      if (cmd == "mqtt-status") {
+        Serial.println("\n📨 MQTT Configuration:");
+        Serial.print("  Enabled: ");
+        Serial.println(mqttEnabled ? "✓ Yes" : "✗ No");
+        Serial.print("  Connected: ");
+        Serial.println(mqttConnected ? "✓ Yes" : "✗ No");
+        Serial.print("  Server: ");
+        Serial.println(mqttServer.length() > 0 ? mqttServer : "(not set)");
+        Serial.print("  Port: ");
+        Serial.println(mqttPort);
+        Serial.print("  Username: ");
+        Serial.println(mqttUsername.length() > 0 ? mqttUsername : "(not set)");
+        Serial.print("  Password: ");
+        Serial.println(mqttPassword.length() > 0 ? "********" : "(not set)");
+        Serial.print("  Topic: ");
+        Serial.println(mqttTopic);
+        Serial.print("  Device Name: ");
+        Serial.println(mqttDeviceName);
+        Serial.print("  Publish Interval: ");
+        Serial.print(mqttPublishInterval / 1000);
+        Serial.println(" seconds");
+        Serial.print("  Messages Published: ");
+        Serial.println(mqttPublishCounter);
+        Serial.println("\n  Payload Content:");
+        Serial.print("    Timestamp: ");
+        Serial.println(mqttIncludeTimestamp ? "✓" : "✗");
+        Serial.print("    BME280: ");
+        Serial.println(mqttIncludeBME280 ? "✓" : "✗");
+        Serial.print("    GPS: ");
+        Serial.println(mqttIncludeGPS ? "✓" : "✗");
+        Serial.print("    Battery: ");
+        Serial.println(mqttIncludeBattery ? "✓" : "✗");
+        Serial.print("    PAX Counter: ");
+        Serial.println(mqttIncludePAX ? "✓" : "✗");
+        Serial.print("    System Info: ");
+        Serial.println(mqttIncludeSystem ? "✓" : "✗");
+        Serial.println();
+        
+      } else if (cmd == "mqtt-on") {
+        mqttEnabled = true;
+        Serial.println("✓ MQTT enabled");
+        Serial.println("  Use 'mqtt-save' to persist to NVS");
+        
+      } else if (cmd == "mqtt-off") {
+        mqttEnabled = false;
+        if (mqttClient.connected()) {
+          mqttClient.disconnect();
+        }
+        Serial.println("✓ MQTT disabled");
+        Serial.println("  Use 'mqtt-save' to persist to NVS");
+        
+      } else if (cmd.startsWith("mqtt-server ")) {
+        mqttServer = rawCmd.substring(12);
+        mqttServer.trim();
+        Serial.print("✓ MQTT server set to: ");
+        Serial.println(mqttServer);
+        Serial.println("  Use 'mqtt-save' to persist to NVS");
+        
+      } else if (cmd.startsWith("mqtt-port ")) {
+        String portStr = cmd.substring(10);
+        uint16_t port = portStr.toInt();
+        if (port > 0 && port <= 65535) {
+          mqttPort = port;
+          Serial.print("✓ MQTT port set to: ");
+          Serial.println(mqttPort);
+          Serial.println("  Use 'mqtt-save' to persist to NVS");
+        } else {
+          Serial.println("✗ Invalid port (must be 1-65535)");
+        }
+        
+      } else if (cmd.startsWith("mqtt-user ")) {
+        mqttUsername = rawCmd.substring(10);
+        mqttUsername.trim();
+        Serial.print("✓ MQTT username set to: ");
+        Serial.println(mqttUsername);
+        Serial.println("  Use 'mqtt-save' to persist to NVS");
+        
+      } else if (cmd.startsWith("mqtt-pass ")) {
+        mqttPassword = rawCmd.substring(10);
+        mqttPassword.trim();
+        Serial.println("✓ MQTT password set");
+        Serial.println("  Use 'mqtt-save' to persist to NVS");
+        
+      } else if (cmd.startsWith("mqtt-topic ")) {
+        mqttTopic = rawCmd.substring(11);
+        mqttTopic.trim();
+        Serial.print("✓ MQTT topic set to: ");
+        Serial.println(mqttTopic);
+        Serial.println("  Use 'mqtt-save' to persist to NVS");
+        
+      } else if (cmd.startsWith("mqtt-device ")) {
+        mqttDeviceName = rawCmd.substring(12);
+        mqttDeviceName.trim();
+        Serial.print("✓ MQTT device name set to: ");
+        Serial.println(mqttDeviceName);
+        Serial.println("  Use 'mqtt-save' to persist to NVS");
+        
+      } else if (cmd.startsWith("mqtt-interval ")) {
+        String intervalStr = cmd.substring(14);
+        uint32_t interval = intervalStr.toInt();
+        if (interval >= 5 && interval <= 3600) {
+          mqttPublishInterval = interval * 1000;
+          Serial.print("✓ MQTT publish interval set to ");
+          Serial.print(interval);
+          Serial.println(" seconds");
+          Serial.println("  Use 'mqtt-save' to persist to NVS");
+        } else {
+          Serial.println("✗ Interval must be 5-3600 seconds");
+        }
+        
+      } else if (cmd == "mqtt-test") {
+        if (mqttServer.length() == 0) {
+          Serial.println("✗ MQTT server not configured");
+          Serial.println("  Use 'mqtt-server <server>' to set server");
+        } else {
+          Serial.print("Testing connection to ");
+          Serial.print(mqttServer);
+          Serial.print(":");
+          Serial.println(mqttPort);
+          
+          WiFiClient testWifiClient;
+          PubSubClient testClient(testWifiClient);
+          testClient.setServer(mqttServer.c_str(), mqttPort);
+          
+          String clientId = "TTGO-Test-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+          bool connected = false;
+          
+          if (mqttUsername.length() > 0) {
+            connected = testClient.connect(clientId.c_str(), mqttUsername.c_str(), mqttPassword.c_str());
+          } else {
+            connected = testClient.connect(clientId.c_str());
+          }
+          
+          if (connected) {
+            Serial.println("✓ Connection successful!");
+            testClient.disconnect();
+          } else {
+            Serial.print("✗ Connection failed (code: ");
+            Serial.print(testClient.state());
+            Serial.println(")");
+            Serial.println("  Error codes:");
+            Serial.println("    -4: Connection timeout");
+            Serial.println("    -3: Connection lost");
+            Serial.println("    -2: Connect failed");
+            Serial.println("    -1: Disconnected");
+            Serial.println("     5: Connection refused (bad credentials)");
+          }
+        }
+        
+      } else if (cmd == "mqtt-save") {
+        preferences.begin("mqtt", false);
+        preferences.putBool("enabled", mqttEnabled);
+        preferences.putString("server", mqttServer);
+        preferences.putUShort("port", mqttPort);
+        preferences.putString("username", mqttUsername);
+        preferences.putString("password", mqttPassword);
+        preferences.putString("topic", mqttTopic);
+        preferences.putString("device", mqttDeviceName);
+        preferences.putULong("interval", mqttPublishInterval);
+        preferences.putBool("incTime", mqttIncludeTimestamp);
+        preferences.putBool("incBME", mqttIncludeBME280);
+        preferences.putBool("incGPS", mqttIncludeGPS);
+        preferences.putBool("incBatt", mqttIncludeBattery);
+        preferences.putBool("incPAX", mqttIncludePAX);
+        preferences.putBool("incSys", mqttIncludeSystem);
+        preferences.end();
+        Serial.println("✓ MQTT settings saved to NVS");
+        
+        // Reconnect if enabled
+        if (mqttEnabled && wifiConnected) {
+          if (mqttClient.connected()) {
+            mqttClient.disconnect();
+          }
+          mqttClient.setServer(mqttServer.c_str(), mqttPort);
+          Serial.println("  MQTT client reconfigured");
+        }
+      }
+      
     } else if (cmd == "restart") {
       Serial.println("⚠ Restarting device in 2 seconds...");
       delay(2000);
@@ -6746,6 +10037,7 @@ void handleSerialCommands() {
       Serial.println("  status       - Show system status");
       Serial.println("  wifi-status  - Check WiFi connection");
       Serial.println("  lora-keys    - View LoRa configuration");
+      Serial.println("  mqtt-status  - View MQTT configuration");
       Serial.println("\nType 'menu' for complete command list\n");
       
     } else if (cmd.length() > 0) {
@@ -6774,6 +10066,9 @@ void setup() {
   Serial.print(" | ");
   Serial.print(FIRMWARE_DATE);
   Serial.println("                          ║");
+  Serial.print("║  Build: ");
+  Serial.print(BUILD_TIMESTAMP);
+  Serial.println("                                ║");
   Serial.println("║  License: Apache 2.0                                       ║");
   Serial.println("╚════════════════════════════════════════════════════════════╝");
   Serial.println("\n💡 Type 'menu' for interactive configuration menu");
@@ -6815,9 +10110,19 @@ void setup() {
   Serial.println("=== T22 V1.1 20191212 GPS INITIALIZATION ===");
   delay(500);  // Allow AXP192 power to stabilize
   
-  // Ensure GPS power is enabled (in case NVS had it disabled)
+  // FORCE GPS ENABLE: Override NVS if GPS was disabled
+  // This ensures GPS always starts enabled for troubleshooting
+  if (!gpsEnabled) {
+    Serial.println("⚠️  GPS was disabled in NVS - forcing GPS ON");
+    gpsEnabled = true;
+    saveSystemSettings(); // Persist the change
+  }
+  
+  // Ensure GPS power is enabled
   if (gpsEnabled && axpFound) {
     enableGpsPower();
+  } else if (!axpFound) {
+    Serial.println("❌ Cannot enable GPS power - AXP192 not found!");
   }
   
   // resetGpsModuleViaGpio();  // DISABLED - was preventing GPS LED from turning on
@@ -6839,12 +10144,8 @@ void setup() {
     Serial.println("BME280 not detected on 0x76 or 0x77");
   }
 
-  setupLoRa();
-  
-  // Setup WiFi and Web Server
-  setupWiFi();
-  
-  // Initialize BLE for PAX counter if enabled and BLE scanning is enabled
+  // Initialize BLE before WiFi so the BT controller can claim its memory block
+  // first. Initialising BLE after WiFi scan + AP setup exhausts heap on ESP32.
   if (paxCounterEnabled && paxBleScanEnabled) {
     Serial.println("Initializing BLE scanner for PAX counter...");
     NimBLEDevice::init("");
@@ -6855,6 +10156,11 @@ void setup() {
     Serial.println("BLE scanner initialized");
   }
 
+  setupLoRa();
+  
+  // Setup WiFi and Web Server
+  setupWiFi();
+
   Serial.println("Display pages: ENV -> GPS FIX -> GPS TIME -> LORA");
   Serial.println("Display anti-burn-in: page rotate + pixel shift + periodic display off");
   Serial.println("\nSerial Commands: wifi-reset, wifi-status, help");
@@ -6863,6 +10169,12 @@ void setup() {
 // Main cooperative scheduler loop.
 // Keep this loop responsive so LMIC timing windows are not missed.
 void loop() {
+  // CRITICAL: Do nothing if OTA is in progress
+  if (otaInProgress) {
+    delay(100);
+    return;
+  }
+  
   // Process GPS data only if GPS is enabled
   if (gpsEnabled) {
     while (GpsSerial.available() > 0) {
@@ -6940,11 +10252,61 @@ void loop() {
     updateSensorReadings();
   }
 
+  // WiFi connection state tracking and reconnection
+  if (wifiEnabled && !wifiConfigMode) {
+    static unsigned long lastWifiReconnectAttempt = 0;
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      wifiConnecting = false;
+    } else {
+      if (wifiConnecting && (now - wifiConnectStartedAt) >= 20000) {
+        wifiConnecting = false;
+      }
+      if (wifiConnected) {
+        Serial.println("⚠️  WiFi connection lost, will attempt reconnection...");
+        wifiConnected = false;
+      }
+      // Try to reconnect every 30 seconds
+      if (!wifiConnecting && now - lastWifiReconnectAttempt >= 30000) {
+        lastWifiReconnectAttempt = now;
+        preferences.begin("wifi", true);
+        String savedSSID = preferences.getString("ssid", "");
+        String savedPassword = preferences.getString("password", "");
+        preferences.end();
+        if (savedSSID.length() > 0) {
+          if (debugEnabled) {
+            Serial.println("📡 WiFi reconnecting to: " + savedSSID);
+          }
+          configureWiFiRadio();
+          WiFi.mode(WIFI_STA);
+          wifiConnecting = true;
+          wifiConnectStartedAt = now;
+          WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
+        }
+      }
+    }
+  }
+
+  // MQTT connection management
+  if (mqttEnabled && wifiEnabled && WiFi.status() == WL_CONNECTED) {
+    if (!mqttClient.connected()) {
+      connectMQTT();
+    } else {
+      mqttClient.loop(); // Process MQTT messages
+    }
+  }
+  
   // Use configurable LoRa send interval
   uint32_t loraSendIntervalMs = loraSendIntervalSec * 1000;
   if (now - lastLoraSendAt >= loraSendIntervalMs) {
     lastLoraSendAt = now;
     queueCayenneUplink();
+  }
+  
+  // MQTT publish with independent interval
+  if (mqttEnabled && mqttConnected && (now - lastMqttPublish >= mqttPublishInterval)) {
+    lastMqttPublish = now;
+    publishMQTT();
   }
 
   if (now - lastPageRotate >= DISPLAY_PAGE_MS) {
@@ -7014,6 +10376,16 @@ void loop() {
         lastGoodAlt = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
         lastGoodSats = gps.satellites.isValid() ? gps.satellites.value() : 0;
         lastGoodHdop = gps.hdop.isValid() ? gps.hdop.hdop() : 99.99;
+        
+        // Add position to GPS path history (circular buffer)
+        gpsPath[gpsPathIndex].lat = gps.location.lat();
+        gpsPath[gpsPathIndex].lon = gps.location.lng();
+        gpsPath[gpsPathIndex].timestamp = now;
+        gpsPath[gpsPathIndex].valid = true;
+        gpsPathIndex = (gpsPathIndex + 1) % gpsPathSize;
+        if (gpsPathCount < gpsPathSize) {
+          gpsPathCount++;
+        }
         lastGoodTimestamp = now;
         
         // Save to NVS periodically (not every update to reduce flash wear)

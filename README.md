@@ -1,6 +1,6 @@
 # TTGO T-Beam (T22 V1.1) Sensor Node
 
-**Version:** 2.6.0
+**Version:** 2.7.3
 **Author:** Markus van Kempen
 **Email:** Markus.van.Kempen@gmail.com
 **Organization:** Research | Floor 7½ 🏢🤏
@@ -104,7 +104,7 @@ The firmware has two modes:
 
 ## WiFi Web Dashboard
 
-This firmware includes a comprehensive web dashboard with multiple pages! See [WIFI_SETUP.md](WIFI_SETUP.md) for complete setup instructions.
+This firmware includes a comprehensive web dashboard with multiple pages! See [END_TO_END_GUIDE.md](END_TO_END_GUIDE.md) for the complete setup and usage guide.
 
 **Web Pages:**
 - `/` - Dashboard with real-time sensor data and OpenStreetMap GPS tracking
@@ -113,6 +113,8 @@ This firmware includes a comprehensive web dashboard with multiple pages! See [W
 - `/payload-info` - CayenneLPP documentation and channel configuration
 - `/diagnostics` - System diagnostics with frame counter reset
 - `/debug` - Live debug console with Serial output
+- `/ota` - Over-the-Air firmware updates (URL or file upload)
+- `/mqtt` - MQTT broker configuration and JSON payload publishing
 - `/about` - Developer information and project details
 
 **Quick Start:**
@@ -123,7 +125,7 @@ This firmware includes a comprehensive web dashboard with multiple pages! See [W
 5. View real-time sensor data and GPS location on OpenStreetMap
 ### Web Dashboard Screenshots
 
-> **Note:** Screenshots can be automatically captured using the included Python script. See [SCREENSHOTS.md](SCREENSHOTS.md) for instructions.
+> **Note:** Screenshots are stored in the `screenshots/` directory. See [END_TO_END_GUIDE.md](END_TO_END_GUIDE.md) for a full walkthrough of each page.
 
 #### Dashboard - Real-time Sensor Data & GPS Tracking
 ![Dashboard](screenshots/dashboard.png)
@@ -164,6 +166,17 @@ This firmware includes a comprehensive web dashboard with multiple pages! See [W
 - `sleep-interval <sec>` - Set sleep wake interval
 - `lora-interval <sec>` - Set LoRa send interval
 - `lora-keys` - View/configure LoRa keys
+- `mqtt-status` - Show MQTT configuration
+- `mqtt-on/off` - Enable/disable MQTT publishing
+- `mqtt-server <server>` - Set MQTT broker server
+- `mqtt-port <port>` - Set MQTT broker port (1-65535)
+- `mqtt-user <username>` - Set MQTT username
+- `mqtt-pass <password>` - Set MQTT password
+- `mqtt-topic <topic>` - Set MQTT topic
+- `mqtt-device <name>` - Set device name
+- `mqtt-interval <sec>` - Set publish interval (5-3600)
+- `mqtt-test` - Test MQTT connection
+- `mqtt-save` - Save MQTT settings to NVS
 - `pax-on/off` - Enable/disable PAX counter
 - `pax-wifi-on/off` - Enable/disable WiFi scanning
 - `pax-ble-on/off` - Enable/disable BLE scanning
@@ -201,28 +214,44 @@ AA 03 00 01 51 80 - Sleep 24 hours (86400 sec)
 AA 04 00 00 03 84 - Send every 15 minutes (900 sec)
 ```
 
-See [DOWNLINK_COMMANDS.md](DOWNLINK_COMMANDS.md) for complete documentation with hex calculations and power management scenarios.
+See [END_TO_END_GUIDE.md#11-lorawan-downlink-commands](END_TO_END_GUIDE.md#11-lorawan-downlink-commands) for complete documentation with hex calculations and power management scenarios.
+
+## Project Structure
+
+```
+TTGO-T-Beam-Sensor-Node-with-Web-Dashboard/
+├── src/
+│   └── main.cpp              # Main firmware (~11 000 lines)
+├── include/
+│   └── lorawan_secrets.h     # LoRaWAN credentials (not committed)
+├── screenshots/              # Web UI screenshots (PNG)
+├── CHANGELOG.md              # Full version history
+├── END_TO_END_GUIDE.md       # Complete usage guide (this repo)
+├── platformio.ini            # PlatformIO build configuration
+└── README.md                 # This file
+```
 
 ## Version History
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed version history and release notes.
 
-**Current Version:** 2.6.0 (2026-03-19)
-- **NEW:** PAX Counter mode (WiFi + BLE device scanning for crowd monitoring)
-- **NEW:** Payload configuration page with channel enable/disable
-- **NEW:** Diagnostics page with frame counter reset and downlink counter
-- **NEW:** About page with developer information
-- **NEW:** ABP mode support in web UI
-- **NEW:** NVS persistence for system settings
-- **NEW:** Battery voltage display on OLED and web dashboard
-- GPS hardware power control via AXP192
-- GPS power fix for NVS persistence
-- Debug logging for web page handlers
+**Current Version:** 2.7.3 (2026-03-23)
+- **NEW:** OLED firmware update progress (shows KB written and status on display during OTA)
+- **NEW:** MQTT support with JSON payload publishing
+- **NEW:** MQTT configuration page (broker, port, credentials, topic)
+- **NEW:** OTA firmware updates (URL download or file upload)
+- **NEW:** GPS path tracking with configurable size (5-100 positions)
+- **NEW:** Automatic GPS force-enable on boot (fixes LED not blinking issue)
+- **NEW:** MQTT status in diagnostics page
+- PAX Counter mode (WiFi + BLE device scanning)
+- Payload configuration with channel enable/disable
+- Diagnostics page with frame counter reset
+- ABP mode support in web UI
+- NVS persistence for all system settings
+- Battery voltage display on OLED and web dashboard
 - Apache License 2.0
 
 ## Build and Upload
-
-From project folder:
 
 ```bash
 platformio run
@@ -230,22 +259,7 @@ platformio run --target upload --upload-port /dev/cu.usbserial-01E5CD55
 platformio device monitor --baud 115200 --port /dev/cu.usbserial-01E5CD55
 ```
 
-## Screenshot Capture Tool
-
-An automated Python script is included to capture screenshots of all web dashboard pages:
-
-```bash
-# Install dependencies
-pip install -r requirements-screenshots.txt
-
-# Capture all pages (ensure device is powered on and connected)
-python3 capture_screenshots.py
-
-# Custom IP address
-python3 capture_screenshots.py --ip 192.168.1.100
-```
-
-The script automatically captures full-page screenshots of all 7 web pages and saves them to the `screenshots/` directory. See [SCREENSHOTS.md](SCREENSHOTS.md) for detailed instructions.
+See [END_TO_END_GUIDE.md](END_TO_END_GUIDE.md) for the complete setup walkthrough, serial command reference, OTA instructions, and troubleshooting guide.
 
 
 ## Troubleshooting Quick Guide
@@ -264,11 +278,33 @@ The script automatically captures full-page screenshots of all 7 web pages and s
 - Clock sync now only accepts plausible GPS date/time + fix quality.
 - If no fix, system clock remains unsynced (expected).
 
-### GPS LED not blinking
-- Check Serial Monitor for "✓ GPS power enabled (AXP192 LDO3 ON)"
-- Try serial command: `gps-on`
-- Check `/diagnostics` page for GPS status
-- Verify `gpsEnabled` setting in `/settings` page
+### GPS LED not blinking (NO POWER)
+**This is the most common GPS issue!** The blue LED not blinking means GPS has no power.
+
+**Quick Fix (Serial Monitor):**
+```
+gps-on
+```
+You should immediately see: `✓ GPS power enabled (AXP192 LDO3 ON)` and the blue LED will start blinking within 1-2 seconds.
+
+**Quick Fix (Web Dashboard):**
+1. Go to `http://YOUR_DEVICE_IP/settings`
+2. Toggle "GPS Enable" to **ON**
+3. Click "Save Settings"
+4. Blue LED should start blinking within 2-3 seconds
+
+**Automatic Fix (v2.6.1+):**
+The firmware now automatically detects if GPS is disabled in NVS and forces it ON during boot. You'll see:
+```
+⚠️  GPS was disabled in NVS - forcing GPS ON
+✓ GPS power enabled (AXP192 LDO3 ON)
+```
+
+**If LED still doesn't blink:**
+- Check Serial Monitor for "AXP192 not found" - indicates I2C issue
+- Verify GPS antenna is connected to U.FL connector
+- Check power supply (USB or battery voltage)
+- See [GPS_TROUBLESHOOTING guide](END_TO_END_GUIDE.md#13-troubleshooting) for detailed diagnostics
 
 ### Web pages showing 500 errors
 - Check Serial Monitor for page serving messages
@@ -278,12 +314,76 @@ The script automatically captures full-page screenshots of all 7 web pages and s
 
 ## New Features
 
+### MQTT Support
+Publish sensor data to any MQTT broker in JSON format. Configure via `/mqtt` page:
+- **Broker Settings**: Server hostname/IP, port (default 1883)
+- **Authentication**: Optional username and password
+- **Topic Configuration**: Customize MQTT topic (default: `ttgo/sensor`)
+- **Enable/Disable**: Toggle MQTT publishing on/off
+- **Test Connection**: Verify broker connectivity
+- **JSON Payload**: Complete sensor data in structured JSON format
+- **Status Monitoring**: View connection status and publish count in diagnostics
+
+**JSON Payload Structure:**
+```json
+{
+  "device": "TTGO-T-Beam",
+  "timestamp": 12345,
+  "bme280": {
+    "temperature": 22.5,
+    "humidity": 45.2,
+    "pressure": 1013.25,
+    "altitude": 123.4
+  },
+  "gps": {
+    "latitude": 51.5074,
+    "longitude": -0.1278,
+    "altitude": 11.0,
+    "satellites": 8,
+    "hdop": 1.2,
+    "speed": 0.0,
+    "course": 0.0
+  },
+  "battery_voltage": 4.1,
+  "battery_current": 150,
+  "battery_charging": true,
+  "pax": {
+    "wifi": 5,
+    "ble": 3,
+    "total": 8
+  },
+  "system": {
+    "uptime": 3600,
+    "free_heap": 180000,
+    "wifi_rssi": -45,
+    "lora_joined": true
+  }
+}
+```
+
+### OTA Firmware Updates
+Update firmware remotely via `/ota` page:
+- **URL-based Update**: Download firmware from HTTP/HTTPS URL
+- **File Upload**: Upload firmware binary directly from browser
+- **Progress Tracking**: Real-time progress indicator
+- **Automatic Reboot**: Device restarts after successful update
+- **Error Handling**: Clear error messages for troubleshooting
+
+### GPS Path Tracking
+Track and visualize GPS movement history:
+- **Configurable Size**: Store 5-100 GPS positions (default: 20)
+- **Polyline Visualization**: Draw path on OpenStreetMap
+- **NVS Persistence**: Path size setting survives reboots
+- **API Endpoint**: `/api/gps-history` returns JSON array of positions
+- **Web UI Control**: Adjust path size via `/settings` page
+
 ### PAX Counter
-The PAX counter scans for nearby WiFi access points and BLE devices to estimate crowd size. Configure via `/payload-info` page:
+Scan for nearby WiFi access points and BLE devices to estimate crowd size:
 - Enable/disable PAX counting
 - Set scan interval (30-3600 seconds)
 - View real-time device counts
 - Data sent on Channel 10 (optional)
+- Configure via `/payload-info` page
 
 ### Channel Configuration
 Individual payload channels can be enabled/disabled via `/payload-info` page:
@@ -297,6 +397,9 @@ The `/diagnostics` page provides:
 - Uplink/downlink message counters
 - Frame counter display (LMIC.seqnoUp/seqnoDn)
 - Frame counter reset button
+- LoRa signal information (RSSI, SNR, frequency, data rate)
+- WiFi connection details
+- MQTT connection status and publish count
 - System health metrics
 - Auto-refresh every 5 seconds
 

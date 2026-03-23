@@ -5,6 +5,103 @@ All notable changes to the TTGO T-Beam Sensor Node project will be documented in
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.3] - 2026-03-23
+
+### Added
+- OLED display feedback during OTA firmware update:
+  - Shows "Firmware Update / Uploading... / Do NOT power off!" at upload start
+  - Shows KB-written progress counter every 64 KB during transfer
+  - Shows "Upload complete! / Restarting..." on successful completion
+  - Shows error messages ("begin() failed" / "end() failed") on OTA failure
+- Public end-to-end documentation in `docs/` directory with full UI walkthrough and serial interface reference
+
+### Changed
+- Version bumped to 2.7.3 with consolidated release for GitHub
+
+## [2.7.2] - 2026-03-22
+
+### Fixed
+- Moved NimBLE initialisation to before `setupWiFi()` so the BT controller
+  claims its memory block first; initialising BLE after WiFi scan + AP setup
+  exhausted heap and caused an `abort()`
+- Enabled WiFi modem sleep (`WIFI_PS_MIN_MODEM`) whenever BLE is active;
+  the ESP32 coexistence layer requires modem sleep when both radio stacks run
+  simultaneously — disabling it caused an immediate `abort()` on boot
+
+### Changed
+- `logWiFiScanForTarget()` now lists **all** visible networks (not just the
+  target) so signal strength, channel and encryption type of every nearby AP
+  are visible in the serial log; the target network is marked with `►`
+
+## [2.7.1] - 2026-03-22
+
+### Fixed
+- Simplified OTA file upload handler so web-based firmware updates no longer suspend networking tasks during upload
+- Aligned WiFi credential storage between serial `wifi-set`, boot-time reconnect, and the web UI WiFi configuration page
+- Fixed WiFi connection attempts started from AP mode by fully tearing down AP state before switching to STA mode
+- Added WiFi connection-state tracking so reconnect logic and PAX scans do not interfere with an active connection attempt
+
+### Changed
+- Added ESP32 WiFi radio configuration for more reliable station connections, including disabled WiFi power save and explicit 2.4 GHz channel policy
+- Added target SSID pre-connect scan diagnostics to improve troubleshooting from serial logs
+- Reduced dashboard polling load and separated GPS path fetching to make the web UI more responsive
+
+## [2.7.0] - 2026-03-21
+
+### Added
+- **OTA Update Improvements**
+  - Fixed OTA upload crash at PC 0x400827f6
+  - Added watchdog timer management (disable during OTA, re-enable after)
+  - Added FreeRTOS task suspension during flash operations
+  - Enhanced error recovery with proper cleanup on failure
+  - OTA now completes successfully without system crashes
+
+- **WiFi Connection Enhancements**
+  - Added 30-second connection timeout (previously hung indefinitely)
+  - Added 3 retry attempts before entering AP mode
+  - Enhanced WiFi status logging with detailed error messages
+  - Added OLED display feedback during WiFi setup:
+    - "Initializing..." during startup
+    - "Connecting to saved network..." during connection attempts
+    - "Connection Failed!" on failure with AP mode info
+    - "WiFi Connected!" with SSID, IP, and RSSI on success
+  - New serial command: `wifi-info` - Shows saved WiFi credentials and current status
+  - Enhanced `wifi-reset` command with detailed instructions
+
+- **MQTT Enhancements**
+  - Increased MQTT buffer size from 128 to 512 bytes (fixes publish failures)
+  - Enhanced MQTT logging (always-on, not just debug mode)
+  - Added "Send Test Message" button to MQTT web UI
+  - Added `/api/mqtt-publish` endpoint for manual publishing
+  - Added automatic buffer size checking with helpful error messages
+  - Added IP address to MQTT payload (`system.wifi_ip`)
+
+- **LoRa Payload Enhancements**
+  - Added Channel 11: WiFi IP Address (encoded as float for CayenneLPP)
+  - IP encoded as: 192.168.1.100 → 192.168101 (divide by 1000000 to decode)
+
+- **Diagnostics Page Enhancements**
+  - Added "Reboot Device" button with explanation
+  - Added "Factory Reset" button requiring "RESET" confirmation
+  - Detailed explanations of what each action does
+
+- **Serial Commands**
+  - Added 11 MQTT serial commands (mqtt-status, mqtt-on/off, mqtt-server, mqtt-port, mqtt-user, mqtt-pass, mqtt-topic, mqtt-device, mqtt-interval, mqtt-test, mqtt-save)
+  - Added `wifi-info` command to show saved credentials
+  - Enhanced `wifi-reset` command with better feedback
+  - Added MQTT section to serial menu
+
+### Fixed
+- OTA upload crash (abort() at PC 0x400827f6) - now completes successfully
+- WiFi connection hanging indefinitely - now times out properly
+- MQTT publish failures due to small buffer size
+- GPS blue LED not blinking - automatic force-enable on boot (from v2.6.1)
+
+### Changed
+- WiFi connection now shows real-time status on OLED display
+- MQTT logging always enabled (not just in debug mode)
+- Improved user feedback for all WiFi and MQTT operations
+
 ## [2.6.0] - 2026-03-19
 
 ### Added

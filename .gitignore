@@ -3,6 +3,8 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+.vscode/settings.json
+.DS_Store
 
 # Python
 __pycache__/
@@ -14,6 +16,13 @@ env/
 venv/
 ENV/
 .venv
+
+# Excluded directories - not published to GitHub
+tests/
+test/
+backup/
+internal/
+docs/
 
 # Screenshots (optional - uncomment to exclude from git)
 # screenshots/
