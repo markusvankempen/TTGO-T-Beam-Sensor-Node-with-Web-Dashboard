@@ -5,6 +5,18 @@ All notable changes to the TTGO T-Beam Sensor Node project will be documented in
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.4] - 2026-03-24
+
+### Added
+- I²C bus scanner on diagnostics page (`/api/i2c-scan`) — scans addresses 1–126 and identifies known T-Beam peripherals (OLED, AXP192, RTC, BME280, GPS)
+- OLED and BME280 I²C address dropdowns on diagnostics page — changeable from 0x3C/0x3D and 0x76/0x77 without recompiling
+- "💾 Save Addresses & Reboot" button on diagnostics page — writes updated addresses to NVS and reboots
+
+### Changed
+- Boot banner, serial menu, and all documentation now consistently include Email, Organization (Research | Floor 7½ 🏢🤏), and Motto fields
+- `END_TO_END_GUIDE.md` header updated with full author block and today's date
+- Version bumped to 2.7.4
+
 ## [2.7.3] - 2026-03-23
 
 ### Added

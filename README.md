@@ -1,6 +1,6 @@
 # TTGO T-Beam (T22 V1.1) Sensor Node
 
-**Version:** 2.7.3
+**Version:** 2.7.4
 **Author:** Markus van Kempen
 **Email:** Markus.van.Kempen@gmail.com
 **Organization:** Research | Floor 7½ 🏢🤏
@@ -186,6 +186,7 @@ This firmware includes a comprehensive web dashboard with multiple pages! See [E
 - `channel-disable <1-10>` - Disable payload channel
 - `channel-status` - Show all channel states
 - `debug-on/off` - Toggle verbose debugging
+- `serial-on/off` - Enable/disable serial output (auto-mutes after 10 min inactivity)
 - `help` - Show all commands
 
 **LoRaWAN Downlink Control (Enhanced Protocol):**
@@ -235,7 +236,7 @@ TTGO-T-Beam-Sensor-Node-with-Web-Dashboard/
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed version history and release notes.
 
-**Current Version:** 2.7.3 (2026-03-23)
+**Current Version:** 2.7.4 (2026-03-24)
 - **NEW:** OLED firmware update progress (shows KB written and status on display during OTA)
 - **NEW:** MQTT support with JSON payload publishing
 - **NEW:** MQTT configuration page (broker, port, credentials, topic)

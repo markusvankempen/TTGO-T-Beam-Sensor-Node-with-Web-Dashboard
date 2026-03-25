@@ -1,9 +1,11 @@
 # TTGO T-Beam Sensor Node — End-to-End Guide
 
-**Version:** 2.7.3  
-**Author:** Markus van Kempen | markus.van.kempen@gmail.com  
+**Version:** 2.7.4  
+**Author:** Markus van Kempen  
+**Email:** markus.van.kempen@gmail.com  
 **Organization:** Research | Floor 7½ 🏢🤏  
-**Last Updated:** 2026-03-23
+**Motto:** "No bug too small, no syntax too weird."  
+**Last Updated:** 2026-03-24
 
 ---
 
@@ -723,6 +725,6 @@ This is a known ESP-IDF message that appears only when `detachInterrupt()` is ca
 
 ---
 
-*Generated for firmware v2.7.3 — 2026-03-23*  
+*Generated for firmware v2.7.4 — 2026-03-24*  
 *Repository: [TTGO-T-Beam-Sensor-Node-with-Web-Dashboard](https://github.com/markusvankempen/TTGO-T-Beam-Sensor-Node-with-Web-Dashboard)*  
 *License: Apache License 2.0*
